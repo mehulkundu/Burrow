@@ -4,7 +4,7 @@ import SwiftUI
 
 /// Screenshot mode for agents.
 ///   APP_STORE=/tmp/Burrow-test APP_SNAPSHOT=/tmp/Burrow-shots Burrow   (tools/snap.sh)
-/// writes thismac, folder, search, and cut PNGs in light and dark, then quits.
+/// writes home, thismac, folder, icons, and search PNGs in light and dark, then quits.
 enum Snapshot {
     private static var started = false
 
@@ -29,29 +29,42 @@ enum Snapshot {
             try? await Task.sleep(for: .seconds(1.5))
             for mode in ["light", "dark"] {
                 NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
-                model.go(.thisMac)
+                let (iconView, showDetails) = (model.prefs.iconView, model.prefs.showDetails)
+                model.prefs.iconView = false
+                model.prefs.showDetails = false
+                for page in [Location.home, .thisMac] {
+                    model.go(page)
+                    await model.settle()
+                    try? await Task.sleep(for: .seconds(0.8))
+                    capture(to: "\(dir)/\(page == .home ? "home" : "thismac")-\(mode).png")
+                }
+                model.searchText = "Desktop"
+                await model.settle()
                 try? await Task.sleep(for: .seconds(0.8))
-                capture(to: "\(dir)/thismac-\(mode).png")
+                capture(to: "\(dir)/thismac-search-\(mode).png")
+                model.searchText = ""
 
                 model.go(.folder(root.path))
                 await model.settle()
-                model.selection = Set(model.rows.filter { $0.name.hasPrefix("file") }.map(\.url))
+                // Only the faded look: the real pasteboard stays as the user left it.
+                Clip.shared.cut = Set(model.rows.filter { $0.name.hasPrefix("file") }.map(\.url))
+                model.selection = Set(model.rows.filter { $0.name == "readme.txt" }.map(\.url))
+                model.prefs.showDetails = true
                 try? await Task.sleep(for: .seconds(0.8))
                 capture(to: "\(dir)/folder-\(mode).png")
-
-                // Only the faded look: the real pasteboard stays as the user left it.
-                Clip.shared.cut = model.selection
-                model.selection = []
-                if let readme = model.rows.first(where: { $0.name == "readme.txt" }) { model.startRename(readme.url) }
-                try? await Task.sleep(for: .seconds(0.8))
-                capture(to: "\(dir)/cut-rename-\(mode).png")
-                model.renaming = nil
                 Clip.shared.cut = []
+                model.prefs.showDetails = false
+
+                model.prefs.iconView = true
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(to: "\(dir)/icons-\(mode).png")
+                model.prefs.iconView = false
 
                 model.searchText = "report"
                 await model.settle()
                 try? await Task.sleep(for: .seconds(0.8))
                 capture(to: "\(dir)/search-\(mode).png")
+                (model.prefs.iconView, model.prefs.showDetails) = (iconView, showDetails)
             }
             print("SNAPSHOT done \(dir)")
             NSApp.terminate(nil)

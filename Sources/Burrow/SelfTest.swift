@@ -32,6 +32,7 @@ enum SelfTest {
             @MainActor func names() -> [String] { b.rows.map(\.name) }
             @MainActor func url(_ name: String) -> URL? { b.rows.first { $0.name == name }?.url }
 
+            check("a new window starts at Home", b.location == .home && b.crumbs.map(\.title) == ["Home"])
             b.go(.folder(root.path))
             await b.settle()
             check("folders come first", Array(names().prefix(2)) == ["Documents", "Photos"], "\(names())")
@@ -48,7 +49,23 @@ enum SelfTest {
             check("sort by size puts the biggest file first, folders last",
                   ["readme.txt", "file10.txt"].contains(names().first ?? "") && ["Documents", "Photos"].contains(names().last ?? ""),
                   "\(names())")
+            check("the Sort menu shows the column and order", b.sortColumn == "Size" && !b.sortAscending)
+            b.sortAscending = true
+            check("Ascending flips the order back", b.sortAscending && ["Documents", "Photos"].contains(names().first ?? ""))
             b.sort(by: "Name")
+
+            // Selection
+            b.selectAll()
+            check("select all", b.selection.count == b.rows.count)
+            b.selection = [url("readme.txt")!]
+            b.invertSelection()
+            check("invert selection", b.selection.count == b.rows.count - 1 && !b.selection.contains(url("readme.txt")!))
+            b.click(url("Documents")!, command: false, shift: false)
+            b.click(url("file10.txt")!, command: false, shift: true)
+            check("shift-click selects a range in the icon view", b.selection.count == 4, "\(b.selectedItems.map(\.name))")
+            b.click(url("todo.md")!, command: true, shift: false)
+            check("cmd-click adds one", b.selection.count == 5)
+            b.selection = []
 
             // Ctrl+C, Ctrl+V in the same folder
             b.copy([url("readme.txt")!], cut: false)
@@ -88,6 +105,10 @@ enum SelfTest {
             check("a wrong path shows an error", b.alert != nil)
             b.alert = nil
             check("crumbs start at This Mac", b.crumbs.first?.title == "This Mac")
+            b.go(.folder(URL.homeDirectory.path + "/Documents"))
+            check("folders in your home show your name, not the disk", b.crumbs.map(\.title) == ["This Mac", NSUserName(), "Documents"])
+            b.go(path: "home")
+            check("the address bar takes Home", b.location == .home)
 
             // Rename, new folder, folder into itself
             b.go(.folder(root.path))
@@ -105,6 +126,11 @@ enum SelfTest {
             b.renaming = nil
             await b.newFolder()
             check("a second new folder is 'New folder (2)'", exists("New folder (2)"))
+            b.renaming = nil
+            await b.newTextDocument()
+            check("New > Text Document makes one and starts renaming",
+                  exists("New Text Document.txt") && b.renaming?.lastPathComponent == "New Text Document.txt")
+            b.renaming = nil
             b.copy([url("Documents")!], cut: true)
             b.go(.folder(docs.appending(path: "Archive").path))
             await b.settle()
@@ -127,9 +153,17 @@ enum SelfTest {
             // Search
             b.searchText = "report"
             await b.settle()
-            check("search finds names in subfolders", Set(names()) == ["report-2026.pdf", "old report.txt"], "\(names())")
+            check("search finds names in subfolders (crawled: /tmp is not indexed)",
+                  Set(names()) == ["report-2026.pdf", "old report.txt"], "\(names())")
             b.searchText = ""
             check("clearing search shows the folder again", names().contains("Documents"))
+            let apps = await FS.spotlight(URL(fileURLWithPath: "/System/Applications"), for: "calculator", hidden: false)
+            check("indexed folders answer from Spotlight", apps.contains { $0.name == "Calculator.app" }, "\(apps.map(\.name))")
+            b.go(.thisMac)
+            b.searchText = "Desktop"
+            await b.settle()
+            check("searching from This Mac lists results (it used to show nothing)", b.isSearchActive && !b.rows.isEmpty)
+            b.searchText = ""
 
             // Quick access
             prefs.togglePin(docs.path)

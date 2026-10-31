@@ -4,7 +4,7 @@ import SwiftUI
 // Burrow: a file manager that works like Windows File Explorer.
 //   Burrow                                     the app
 //   APP_STORE=/tmp/<dir> Burrow --selftest     run the self-test in a /tmp folder, quit with 0 or 1 (tools/selftest.sh)
-//   APP_STORE=/tmp/<dir> APP_SNAPSHOT=<dir> Burrow   PNGs of This Mac, a folder, and a search, light and dark (tools/snap.sh)
+//   APP_STORE=/tmp/<dir> APP_SNAPSHOT=<dir> Burrow   PNGs of Home, This Mac, a folder, icons, and a search, light and dark (tools/snap.sh)
 
 @main
 struct BurrowApp: App {
@@ -16,7 +16,8 @@ struct BurrowApp: App {
                 .frame(minWidth: 760, minHeight: 440)
         }
         .defaultSize(width: 1180, height: 720)
-        .windowToolbarStyle(.unifiedCompact)
+        // Explorer draws its own header row; the Mac title bar would be a second one.
+        .windowStyle(.hiddenTitleBar)
         .commands {
             SidebarCommands()
             FileCommands()

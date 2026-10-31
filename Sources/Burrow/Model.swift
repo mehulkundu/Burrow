@@ -1,7 +1,9 @@
 import AppKit
+import CoreServices
 
-/// Where a window is: the This Mac page, or a folder path (no trailing slash).
+/// Where a window is: Home, the This Mac page, or a folder path (no trailing slash).
 enum Location: Hashable {
+    case home
     case thisMac
     case folder(String)
 }
@@ -93,6 +95,54 @@ nonisolated enum FS {
         return x.isEqual(y)
     }
 
+    /// Spotlight's answer for names containing `query` under `root`: the Mac's
+    /// search index, as Explorer uses the Windows index. Hidden files and
+    /// ~/Library are left out unless hidden items are shown, as AppData is on Windows.
+    @concurrent static func spotlight(_ root: URL, for query: String, hidden: Bool) async -> [FileItem] {
+        let paths = mdfind(["-onlyin", root.path, "-name", query], hidden: hidden, limit: 2000)
+        return paths.compactMap { item(URL(fileURLWithPath: $0)) }.filter { hidden || !$0.isHidden }
+    }
+
+    /// Files opened in the last two weeks, newest first, for Home.
+    @concurrent static func recent() async -> [RecentFile] {
+        let paths = mdfind(["-onlyin", URL.homeDirectory.path, "kMDItemLastUsedDate >= $time.today(-14)"], hidden: false, limit: 500)
+        let used = paths.compactMap { path -> (String, Date)? in
+            guard let md = MDItemCreate(kCFAllocatorDefault, path as CFString),
+                  let date = MDItemCopyAttribute(md, kMDItemLastUsedDate) as? Date else { return nil }
+            return (path, date)
+        }
+        return used.sorted { $0.1 > $1.1 }.lazy
+            .compactMap { path, date in item(URL(fileURLWithPath: path)).map { RecentFile(item: $0, used: date) } }
+            .filter { !$0.item.isFolder }
+            .prefix(30).map { $0 }
+    }
+
+    /// Runs mdfind and reads paths as they arrive, up to `limit`.
+    private static func mdfind(_ arguments: [String], hidden: Bool, limit: Int) -> [String] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/mdfind")
+        process.arguments = arguments
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        guard (try? process.run()) != nil else { return [] }
+        let library = URL.homeDirectory.path + "/Library/"
+        var paths: [String] = [], buffer = Data()
+        reading: while !Task.isCancelled {
+            let chunk = pipe.fileHandleForReading.availableData
+            if chunk.isEmpty { break }
+            buffer.append(chunk)
+            while let newline = buffer.firstIndex(of: 10) {
+                let path = String(decoding: buffer[buffer.startIndex..<newline], as: UTF8.self)
+                buffer.removeSubrange(buffer.startIndex...newline)
+                if hidden || (!path.contains("/.") && !path.hasPrefix(library)) { paths.append(path) }
+                if paths.count >= limit { break reading }
+            }
+        }
+        if process.isRunning { process.terminate() }
+        return paths
+    }
+
     /// Names that contain `query`, anywhere under `root`, in batches as they are found.
     static func search(_ root: URL, for query: String, hidden: Bool) -> AsyncStream<[FileItem]> {
         AsyncStream { continuation in
@@ -128,6 +178,12 @@ nonisolated enum FS {
     }
 }
 
+nonisolated struct RecentFile: Identifiable, Sendable {
+    let item: FileItem
+    let used: Date
+    var id: URL { item.url }
+}
+
 nonisolated struct Volume: Identifiable, Sendable {
     let path: String
     let name: String
@@ -161,24 +217,35 @@ enum Places {
         }
     }
 
+    static var iCloudDrive: String? {
+        let path = URL.homeDirectory.path + "/Library/Mobile Documents/com~apple~CloudDocs"
+        return FileManager.default.fileExists(atPath: path) ? path : nil
+    }
+
     static func name(_ path: String) -> String {
         FileManager.default.displayName(atPath: path)
     }
 }
 
-/// Settings every window shares: Quick access pins and hidden items.
+/// Settings every window shares: Favorites, hidden items, the view, the details pane.
 @Observable final class Prefs {
     static let shared = Prefs(defaults: .standard)
     @ObservationIgnored let defaults: UserDefaults
 
     var pins: [String] { didSet { defaults.set(pins, forKey: "pins") } }
     var showHidden: Bool { didSet { defaults.set(showHidden, forKey: "showHidden") } }
+    /// Large icons instead of Details.
+    var iconView: Bool { didSet { defaults.set(iconView, forKey: "iconView") } }
+    var showDetails: Bool { didSet { defaults.set(showDetails, forKey: "showDetails") } }
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
         let home = URL.homeDirectory.path
-        pins = defaults.stringArray(forKey: "pins") ?? ["Desktop", "Downloads", "Documents", "Pictures"].map { home + "/" + $0 }
+        pins = defaults.stringArray(forKey: "pins")
+            ?? ["Desktop", "Downloads", "Documents", "Pictures", "Music", "Movies"].map { home + "/" + $0 }
         showHidden = defaults.bool(forKey: "showHidden")
+        iconView = defaults.bool(forKey: "iconView")
+        showDetails = defaults.bool(forKey: "showDetails")
     }
 
     func togglePin(_ path: String) {
@@ -201,8 +268,9 @@ enum Places {
     let prefs: Prefs
     @ObservationIgnored let pasteboard: NSPasteboard
 
-    private(set) var location: Location = .thisMac
+    private(set) var location: Location = .home
     private(set) var rows: [FileItem] = []
+    private(set) var recent: [RecentFile] = []
     private(set) var loadError: String?
     private(set) var isSearching = false
     private(set) var status: String?
@@ -228,6 +296,9 @@ enum Places {
     @ObservationIgnored private var watchedPath: String?
     @ObservationIgnored private var typed = ""
     @ObservationIgnored private var typedAt = Date.distantPast
+    @ObservationIgnored private var anchor: URL?
+    /// Columns in the icon grid, for the arrow keys. The grid sets it.
+    @ObservationIgnored var gridColumns = 1
 
     init(prefs: Prefs = .shared, pasteboard: NSPasteboard = .general) {
         self.prefs = prefs
@@ -240,22 +311,35 @@ enum Places {
 
     var title: String {
         switch location {
+        case .home: "Home"
         case .thisMac: "This Mac"
         case .folder(let path): Places.name(path)
         }
     }
 
     var canGoBack: Bool { !back.isEmpty }
+    var canGoUp: Bool { folder != nil }
     var canGoForward: Bool { !forward.isEmpty }
     var isSearchActive: Bool { results != nil }
     var searchPrompt: String { "Search \(title)" }
 
     var selectedItems: [FileItem] { rows.filter { selection.contains($0.url) } }
 
-    /// This Mac, the volume, then each folder down to here.
+    /// This Mac, then your home folder or the drive, then each folder down to here.
     var crumbs: [(title: String, location: Location)] {
+        if location == .home { return [("Home", .home)] }
         var out: [(String, Location)] = [("This Mac", .thisMac)]
         guard let dir = folder else { return out }
+        let home = URL.homeDirectory.path
+        if dir.path == home || dir.path.hasPrefix(home + "/") {
+            out.append((NSUserName(), .folder(home)))
+            var path = home
+            for part in dir.path.dropFirst(home.count).split(separator: "/") {
+                path += "/" + part
+                out.append((String(part), .folder(path)))
+            }
+            return out
+        }
         var volume = (try? dir.resourceValues(forKeys: [.volumeURLKey]))?.volume?.path ?? "/"
         // /Users sits on the Data volume, but its path starts at /.
         if volume != "/", !dir.path.hasPrefix(volume) { volume = "/" }
@@ -280,6 +364,7 @@ enum Places {
     /// The address bar: a path, ~, or "This Mac". A file opens in its app.
     func go(path text: String) {
         let text = text.trimmingCharacters(in: .whitespaces)
+        if text.caseInsensitiveCompare("Home") == .orderedSame { return go(.home) }
         if text.isEmpty || text.caseInsensitiveCompare("This Mac") == .orderedSame { return go(.thisMac) }
         let path = ((text as NSString).expandingTildeInPath as NSString).standardizingPath
         var isDir: ObjCBool = false
@@ -353,6 +438,10 @@ enum Places {
             watcher = nil
             watchedPath = nil
             items = []
+            if location == .home {
+                let files = await FS.recent()
+                if generation == loadGeneration { recent = files }
+            }
             return
         }
         do {
@@ -403,6 +492,9 @@ enum Places {
 
     // MARK: Search
 
+    /// Explorer's search: the current folder and every subfolder (Home and
+    /// This Mac search your home folder). Spotlight answers first; a folder
+    /// Spotlight doesn't index is crawled instead.
     private func search() {
         searchTask?.cancel()
         let query = searchText.trimmingCharacters(in: .whitespaces)
@@ -417,10 +509,16 @@ enum Places {
         selection = []
         isSearching = true
         searchTask = Task {
-            try? await Task.sleep(for: .milliseconds(150))
-            for await batch in FS.search(root, for: query, hidden: hidden) {
-                if Task.isCancelled { return }
-                results?.append(contentsOf: batch)
+            try? await Task.sleep(for: .milliseconds(200))
+            if Task.isCancelled { return }
+            let indexed = await FS.spotlight(root, for: query, hidden: hidden)
+            if Task.isCancelled { return }
+            results = indexed
+            if indexed.isEmpty {
+                for await batch in FS.search(root, for: query, hidden: hidden) {
+                    if Task.isCancelled { return }
+                    results?.append(contentsOf: batch)
+                }
             }
             if !Task.isCancelled { isSearching = false }
         }
@@ -544,6 +642,46 @@ enum Places {
         await load()
     }
 
+    /// Makes "New Text Document.txt" and starts renaming it.
+    func newTextDocument() async {
+        guard let dir = folder else { return }
+        let url = FS.uniqueURL(in: dir, name: "New Text Document.txt", isFolder: false, copy: false)
+        guard FileManager.default.createFile(atPath: url.path, contents: Data()) else {
+            alert = "Couldn't make a file in this folder."
+            return
+        }
+        pendingSelect = [url.lastPathComponent]
+        pendingRename = true
+        await load()
+    }
+
+    func selectAll() { selection = Set(rows.map(\.url)) }
+    func invertSelection() { selection = Set(rows.map(\.url)).subtracting(selection) }
+
+    /// A click in the icon view: Cmd adds or removes, Shift selects a range.
+    func click(_ url: URL, command: Bool, shift: Bool) {
+        if shift, let anchor, let a = rows.firstIndex(where: { $0.url == anchor }),
+           let b = rows.firstIndex(where: { $0.url == url }) {
+            selection = Set(rows[min(a, b)...max(a, b)].map(\.url))
+            return
+        }
+        if command {
+            if selection.contains(url) { selection.remove(url) } else { selection.insert(url) }
+        } else {
+            selection = [url]
+        }
+        anchor = url
+    }
+
+    /// Arrow keys in the icon view, and Home / End in both views.
+    private func moveSelection(to index: (Int?) -> Int) {
+        guard !rows.isEmpty else { return }
+        let current = rows.firstIndex { selection.contains($0.url) }
+        let next = min(max(index(current), 0), rows.count - 1)
+        selection = [rows[next].url]
+        anchor = rows[next].url
+    }
+
     /// Moves to the Trash, the Recycle Bin of the Mac.
     func trash(_ urls: Set<URL>) async {
         for url in urls {
@@ -562,6 +700,28 @@ enum Places {
         guard let dir = dir ?? folder,
               let terminal = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") else { return }
         NSWorkspace.shared.open([dir], withApplicationAt: terminal, configuration: NSWorkspace.OpenConfiguration())
+    }
+
+    /// The Sort menu's checkmarks.
+    var sortColumn: String {
+        get {
+            switch sortOrder.first?.keyPath {
+            case \FileItem.modified: "Date modified"
+            case \FileItem.kind: "Type"
+            case \FileItem.size: "Size"
+            default: "Name"
+            }
+        }
+        set { sort(by: newValue) }
+    }
+
+    var sortAscending: Bool {
+        get { sortOrder.first?.order != .reverse }
+        set {
+            guard var first = sortOrder.first else { return }
+            first.order = newValue ? .forward : .reverse
+            sortOrder = [first]
+        }
     }
 
     func sort(by column: String) {
@@ -592,7 +752,8 @@ enum Places {
         let alt = mods.contains(.option)
         let key = event.charactersIgnoringModifiers?.lowercased() ?? ""
         // ponytail: the sidebar is a one-column table too; the file list is the one with columns.
-        let inList = ((responder as? NSTableView)?.numberOfColumns ?? 0) > 1
+        let inSidebar = ((responder as? NSTableView)?.numberOfColumns ?? 0) == 1
+        let inList = !inSidebar && !rows.isEmpty
         let picked = inList ? selection : []
 
         switch event.keyCode {
@@ -605,9 +766,18 @@ enum Places {
             focusSearch += 1; return true
         case 118:  // F4
             editingAddress = true; return true
-        case 36, 76:  // Return, Enter
-            guard !picked.isEmpty, !alt else { return false }
+        case 36, 76:  // Return, Enter; Alt+Enter shows the details
+            if alt { prefs.showDetails = true; return true }
+            guard !picked.isEmpty else { return false }
             open(picked); return true
+        case 115 where inList: moveSelection { _ in 0 }; return true                 // Home
+        case 119 where inList: moveSelection { _ in self.rows.count - 1 }; return true  // End
+        case 19 where ctrl && shift: prefs.iconView = true; return true              // Ctrl+Shift+2
+        case 22 where ctrl && shift: prefs.iconView = false; return true             // Ctrl+Shift+6
+        case 123...126 where inList && prefs.iconView && (mods.isEmpty || mods == [.shift]):
+            let step = [123: -1, 124: 1, 125: gridColumns, 126: -gridColumns][Int(event.keyCode)] ?? 0
+            moveSelection { ($0 ?? -step) + step }
+            return true
         case 51, 117:  // Delete, Forward Delete
             guard !picked.isEmpty else { return false }
             Task { await trash(picked) }; return true
@@ -628,7 +798,8 @@ enum Places {
             case "x" where !picked.isEmpty: copy(picked, cut: true); return true
             case "c" where !picked.isEmpty: shift ? copyPaths(picked) : copy(picked, cut: false); return true
             case "v" where folder != nil: Task { await paste() }; return true
-            case "a" where inList: selection = Set(rows.map(\.url)); return true
+            case "a" where inList: selectAll(); return true
+            case "d" where !picked.isEmpty: Task { await trash(picked) }; return true
             case "n" where shift: Task { await newFolder() }; return true
             case "l": editingAddress = true; return true
             case "f", "e": focusSearch += 1; return true
@@ -648,6 +819,7 @@ enum Places {
             return false
         }
         if alt && key == "d" { editingAddress = true; return true }  // Alt+D
+        if alt && key == "p" { prefs.showDetails.toggle(); return true }  // Alt+P, Alt+Shift+P
 
         // Type a name to jump to it.
         if inList, mods.subtracting(.shift).isEmpty, let chars = event.characters, chars.count == 1,

@@ -1,13 +1,14 @@
 # Burrow
 
-A native macOS file manager in SwiftUI that works like Windows File Explorer:
-navigation pane with Quick access pins and a This Mac tree, address bar with
-breadcrumbs, details view, Ctrl+X / Ctrl+C / Ctrl+V, recursive name search.
+A native macOS file manager in SwiftUI that works like Windows 11 File Explorer:
+Home, Favorites and Locations in the navigation pane, header row with breadcrumbs
+and search, command bar, Details and Large icons views, details pane,
+Ctrl+X / Ctrl+C / Ctrl+V, Spotlight-backed search. `docs/EXPLORER.md` is the spec.
 
 ## Layout
 
 - `Sources/Burrow/App.swift` window group (tabs), menus, the /tmp sample folder (`Fixture`).
-- `Sources/Burrow/Model.swift` `FS` (disk work off the main thread), `Prefs` (pins, hidden items), `Clip` (cut marks), `Browser` (one window: navigation, actions, Explorer keys in `handle(_:)`).
+- `Sources/Burrow/Model.swift` `FS` (disk work and Spotlight off the main thread), `Prefs` (Favorites, hidden items, view, details pane), `Clip` (cut marks), `Browser` (one window: navigation, search, actions, Explorer keys in `handle(_:)`).
 - `Sources/Burrow/Views.swift` every view.
 - `build.sh` builds, signs, and installs `~/Applications/Burrow.app`.
 
@@ -15,7 +16,7 @@ breadcrumbs, details view, Ctrl+X / Ctrl+C / Ctrl+V, recursive name search.
 
 - Build and install: `./build.sh` (`--open` restarts the app). Fix every warning.
 - Self-test: `tools/selftest.sh`. Runs real file actions on `/tmp/Burrow-self`, exit 0 when every check passes. Add a check for every new action in `SelfTest.swift`.
-- Snapshots: `tools/snap.sh` writes `/tmp/Burrow-shots/{thismac,folder,cut-rename,search}-{light,dark}.png`. Look at them after UI changes. Without Screen Recording permission the sidebar renders blank.
+- Snapshots: `tools/snap.sh` writes `/tmp/Burrow-shots/{home,thismac,thismac-search,folder,icons,search}-{light,dark}.png`. Look at them after UI changes. Without Screen Recording permission the sidebar renders blank.
 - Self-test and snapshots refuse to run unless `APP_STORE` is in /tmp. They never touch the real pasteboard or the real pins.
 
 ## Rules
