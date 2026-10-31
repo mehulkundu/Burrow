@@ -1,47 +1,52 @@
 import AppKit
-import SwiftData
 import SwiftUI
 
-// Burrow
-//   Burrow                      the app
-//   APP_STORE=<file> Burrow     use another database (tests, experiments)
-//   APP_SNAPSHOT=<dir> Burrow   save a PNG of every sidebar page and Settings tab in light and dark mode, then quit
-//   APP_SEED=1 Burrow           fill an empty /tmp store with sample items (tools/snap.sh)
-//   Burrow --selftest           run the self-test on a /tmp store and quit with 0 or 1 (tools/selftest.sh)
-//   APP_ACCENT=<id> Burrow      run with another accent from Theme.all (UI/Theme.swift)
-//   APP_GRID=1 Burrow           draw the 8 pt grid and the layout probes over the window
+// Burrow: a file manager that works like Windows File Explorer.
+//   Burrow                                     the app
+//   APP_STORE=/tmp/<dir> Burrow --selftest     run the self-test in a /tmp folder, quit with 0 or 1 (tools/selftest.sh)
+//   APP_STORE=/tmp/<dir> APP_SNAPSHOT=<dir> Burrow   PNGs of This Mac, a folder, and a search, light and dark (tools/snap.sh)
 
 @main
 struct BurrowApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @State private var model = AppModel(container: Store.makeContainer())
 
     var body: some Scene {
-        Window("Burrow", id: "main") {
-            ContentView()
-                .environment(model)
-                .themed()
-                .overlay { if GridOverlay.enabled { GridOverlay() } }
-                .frame(minWidth: 760, minHeight: 480)
+        WindowGroup("Burrow", id: "browser") {
+            BrowserView()
+                .frame(minWidth: 760, minHeight: 440)
         }
-        .modelContainer(model.container)
-        .defaultSize(width: 1100, height: 720)
-        .windowToolbarStyle(.unified)
+        .defaultSize(width: 1180, height: 720)
+        .windowToolbarStyle(.unifiedCompact)
         .commands {
             SidebarCommands()
-            ToolbarCommands()
-            CommandGroup(replacing: .newItem) {
-                Button("New Item") { model.addItem() }
-                    .keyboardShortcut("n")
+            FileCommands()
+            CommandGroup(after: .sidebar) {
+                Button("Show or Hide Hidden Items") { Prefs.shared.showHidden.toggle() }
+                    .keyboardShortcut(".", modifiers: [.command, .shift])
             }
         }
+    }
+}
 
-        Settings {
-            SettingsView()
-                .environment(model)
-                .themed()
+struct FileCommands: Commands {
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some Commands {
+        CommandGroup(after: .newItem) {
+            Button("New Tab") {
+                let current = NSApp.keyWindow
+                openWindow(id: "browser")
+                // The new window is key on the next turn of the run loop. Tab it in.
+                DispatchQueue.main.async {
+                    guard let current, let new = NSApp.keyWindow, new !== current else { return }
+                    current.addTabbedWindow(new, ordered: .above)
+                    new.makeKeyAndOrderFront(nil)
+                }
+            }
+            .keyboardShortcut("t")
+            Button("New Folder") { Task { await Browser.active?.newFolder() } }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
         }
-        .windowResizability(.contentSize)
     }
 }
 
@@ -60,27 +65,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-/// Where the data lives: ~/Library/Application Support/Burrow/Burrow.store
-enum Store {
-    /// True when APP_STORE points somewhere else (tests, snapshots, seed data).
-    static var isOverridden: Bool {
-        !(ProcessInfo.processInfo.environment["APP_STORE"] ?? "").isEmpty
-    }
-
-    static var url: URL {
-        if let path = ProcessInfo.processInfo.environment["APP_STORE"], !path.isEmpty {
-            return URL(fileURLWithPath: path)
+/// A sample folder in /tmp for the self-test and snapshots. Never the real disk.
+enum Fixture {
+    static func make() -> URL? {
+        guard let path = ProcessInfo.processInfo.environment["APP_STORE"],
+              path.hasPrefix("/tmp/") || path.hasPrefix("/private/tmp/") else { return nil }
+        let root = URL(fileURLWithPath: path)
+        let fm = FileManager.default
+        try? fm.removeItem(at: root)
+        let files = ["readme.txt", "todo.md", "file2.txt", "file10.txt", ".hidden-config",
+                     "Documents/report-2026.pdf", "Documents/notes.txt", "Documents/Archive/old report.txt",
+                     "Photos/beach.jpg", "Photos/mountains.png"]
+        for file in files {
+            let url = root.appending(path: file)
+            try? fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? Data(repeating: 65, count: file.count * 300).write(to: url)
         }
-        let dir = URL.applicationSupportDirectory.appending(path: "Burrow", directoryHint: .isDirectory)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appending(path: "Burrow.store")
-    }
-
-    static func makeContainer() -> ModelContainer {
-        do {
-            return try ModelContainer(for: Item.self, configurations: ModelConfiguration(url: url))
-        } catch {
-            fatalError("Could not open the database at \(url.path): \(error)")
-        }
+        return root
     }
 }

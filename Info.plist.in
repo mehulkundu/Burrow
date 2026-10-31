@@ -11,7 +11,12 @@
 <key>CFBundleShortVersionString</key><string>0.1</string>
 <key>CFBundleVersion</key><string>__BUILD__</string>
 <key>LSMinimumSystemVersion</key><string>26.0</string>
-<key>LSApplicationCategoryType</key><string>public.app-category.productivity</string>
+<key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
+<key>NSDesktopFolderUsageDescription</key><string>Burrow shows the files in your Desktop folder.</string>
+<key>NSDocumentsFolderUsageDescription</key><string>Burrow shows the files in your Documents folder.</string>
+<key>NSDownloadsFolderUsageDescription</key><string>Burrow shows the files in your Downloads folder.</string>
+<key>NSRemovableVolumesUsageDescription</key><string>Burrow shows the files on your drives.</string>
+<key>NSNetworkVolumesUsageDescription</key><string>Burrow shows the files on network drives.</string>
 </dict></plist>
