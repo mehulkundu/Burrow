@@ -93,6 +93,11 @@ struct FileTable: View {
                         model.drop(urls, onto: item.isFolder ? item.url : nil)
                     }
             }
+            // Dropped between rows: this folder. The table takes every drag over it,
+            // so a drop modifier on the Table itself never fires.
+            .dropDestination(for: URL.self) { _, urls in
+                model.drop(urls, onto: nil)
+            }
         }
         .tableStyle(.inset)
         .alternatingRowBackgrounds(.disabled)
@@ -100,10 +105,6 @@ struct FileTable: View {
             ItemMenu(model: model, ids: ids)
         } primaryAction: { ids in
             model.open(ids)
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            model.drop(urls, onto: nil)
-            return true
         }
         .overlay { EmptyState(model: model) }
     }
@@ -187,15 +188,18 @@ struct IconGrid: View {
                     ForEach(model.rows) { IconTile(item: $0, model: model, size: tile) }
                 }
                 .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                // Fill the visible area so a drop anywhere lands here: the scroll
+                // view itself never sees drops.
+                .frame(maxWidth: .infinity, minHeight: geometry.size.height, alignment: .topLeading)
+                .contentShape(Rectangle())
+                .dropDestination(for: URL.self) { urls, _ in
+                    model.drop(urls, onto: nil)
+                    return true
+                }
             }
             .contentShape(Rectangle())
             .onTapGesture { model.selection = [] }
             .contextMenu { ItemMenu(model: model, ids: []) }
-            .dropDestination(for: URL.self) { urls, _ in
-                model.drop(urls, onto: nil)
-                return true
-            }
             .onAppear { model.gridColumns = columns }
             .onChange(of: columns) { model.gridColumns = columns }
         }

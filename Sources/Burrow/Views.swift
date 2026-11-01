@@ -137,7 +137,6 @@ struct BrowserView: View {
         }
         .animation(.smooth(duration: 0.25), value: prefs.showDetails)
         .animation(.smooth(duration: 0.25), value: prefs.showSidebar)
-        .background { TitleBarArea(window: window) }
         .ignoresSafeArea(.container, edges: .top)
         .navigationTitle(active.title)
         .background(WindowReader { found in
