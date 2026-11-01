@@ -89,11 +89,17 @@ struct BrowserView: View {
 
     var body: some View {
         let active = workspace.active
-        NavigationSplitView {
-            Sidebar(workspace: workspace)
-                .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 360)
-                .toolbar(removing: .sidebarToggle)
-        } detail: {
+        // Glass panels on one backdrop: navigation pane left, files, details pane right.
+        HStack(spacing: 0) {
+            if prefs.showSidebar {
+                Sidebar(workspace: workspace)
+                    .scrollContentBackground(.hidden)
+                    .frame(width: 236)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
+                    // Under the window buttons, like the panel in Finder.
+                    .padding(EdgeInsets(top: 40, leading: 10, bottom: 10, trailing: 0))
+                    .transition(.move(edge: .leading).combined(with: .opacity))
+            }
             HStack(spacing: 0) {
                 PaneView(model: workspace.left, workspace: workspace, isActive: !workspace.rightActive)
                 if let right = workspace.right {
@@ -101,18 +107,21 @@ struct BrowserView: View {
                     PaneView(model: right, workspace: workspace, isActive: workspace.rightActive)
                         .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { workspace.rightPaneX = $0 }
                 }
-                if prefs.showDetails {
-                    // A floating glass panel, the right-hand twin of the sidebar.
-                    DetailsPane(model: active)
-                        .frame(width: 270)
-                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
-                        .padding(10)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
             }
-            .animation(.smooth(duration: 0.25), value: prefs.showDetails)
-            .ignoresSafeArea(.container, edges: .top)
+            // With the navigation pane hidden, the header steps down clear of the window buttons.
+            .padding(.top, prefs.showSidebar ? 0 : 30)
+            if prefs.showDetails {
+                DetailsPane(model: active)
+                    .frame(width: 270)
+                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
+                    .padding(10)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+            }
         }
+        .animation(.smooth(duration: 0.25), value: prefs.showDetails)
+        .animation(.smooth(duration: 0.25), value: prefs.showSidebar)
+        .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
+        .ignoresSafeArea(.container, edges: .top)
         .navigationTitle(active.title)
         .background(WindowReader { found in
             window = found
@@ -637,6 +646,7 @@ struct CommandBar: View {
                     }
                     .pickerStyle(.inline)
                     Section("Show") {
+                        Toggle("Navigation pane", isOn: Bindable(model.prefs).showSidebar)
                         Toggle("Details pane", isOn: Bindable(model.prefs).showDetails)
                         Toggle("Hidden items", isOn: Bindable(model.prefs).showHidden)
                         Toggle("Dual pane", isOn: Binding(get: { workspace.right != nil }, set: { _ in workspace.toggleDual() }))

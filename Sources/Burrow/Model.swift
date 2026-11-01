@@ -404,6 +404,8 @@ enum Places {
     /// Large icons instead of Details.
     var iconView: Bool { didSet { defaults.set(iconView, forKey: "iconView") } }
     var showDetails: Bool { didSet { defaults.set(showDetails, forKey: "showDetails") } }
+    /// The navigation pane on the left (View > Show > Navigation pane in Explorer).
+    var showSidebar: Bool { didSet { defaults.set(showSidebar, forKey: "showSidebar") } }
     /// Search inside files too, as Explorer does in indexed folders.
     var searchContents: Bool { didSet { defaults.set(searchContents, forKey: "searchContents") } }
 
@@ -415,6 +417,7 @@ enum Places {
         showHidden = defaults.bool(forKey: "showHidden")
         iconView = defaults.bool(forKey: "iconView")
         showDetails = defaults.bool(forKey: "showDetails")
+        showSidebar = defaults.object(forKey: "showSidebar") as? Bool ?? true
         searchContents = defaults.bool(forKey: "searchContents")
     }
 

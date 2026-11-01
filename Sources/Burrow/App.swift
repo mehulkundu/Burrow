@@ -19,9 +19,10 @@ struct BurrowApp: App {
         // Explorer draws its own header row; the Mac title bar would be a second one.
         .windowStyle(.hiddenTitleBar)
         .commands {
-            SidebarCommands()
             FileCommands()
-            CommandGroup(after: .sidebar) {
+            CommandGroup(replacing: .sidebar) {
+                Button("Show or Hide Navigation Pane") { Prefs.shared.showSidebar.toggle() }
+                    .keyboardShortcut("s", modifiers: [.command, .control])
                 Button("Show or Hide Hidden Items") { Prefs.shared.showHidden.toggle() }
                     .keyboardShortcut(".", modifiers: [.command, .shift])
             }
