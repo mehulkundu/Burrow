@@ -94,11 +94,12 @@ struct BrowserView: View {
             if prefs.showSidebar {
                 Sidebar(workspace: workspace)
                     .scrollContentBackground(.hidden)
-                    .frame(width: 236)
+                    .frame(width: prefs.sidebarWidth)
                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
                     // Under the window buttons, like the panel in Finder.
                     .padding(EdgeInsets(top: 40, leading: 10, bottom: 10, trailing: 0))
                     .transition(.move(edge: .leading).combined(with: .opacity))
+                ResizeHandle(width: $prefs.sidebarWidth, range: 180...420, growsRight: true)
             }
             HStack(spacing: 0) {
                 PaneView(model: workspace.left, workspace: workspace, isActive: !workspace.rightActive)
@@ -111,16 +112,17 @@ struct BrowserView: View {
             // With the navigation pane hidden, the header steps down clear of the window buttons.
             .padding(.top, prefs.showSidebar ? 0 : 30)
             if prefs.showDetails {
+                ResizeHandle(width: $prefs.detailsWidth, range: 220...520, growsRight: false)
                 DetailsPane(model: active)
-                    .frame(width: 270)
+                    .frame(width: prefs.detailsWidth)
                     .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
-                    .padding(10)
+                    .padding(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 10))
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .animation(.smooth(duration: 0.25), value: prefs.showDetails)
         .animation(.smooth(duration: 0.25), value: prefs.showSidebar)
-        .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
+        .background { TitleBarArea(window: window) }
         .ignoresSafeArea(.container, edges: .top)
         .navigationTitle(active.title)
         .background(WindowReader { found in
@@ -408,7 +410,51 @@ struct HeaderBar: View {
                 .glassEffect(.regular, in: .capsule)
                 .layoutPriority(1)
         }
-        .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
+        .background { TitleBarArea(window: model.window) }
+    }
+}
+
+/// Empty space at the top acts as the title bar: drag to move the window,
+/// double-click to zoom it, as System Settings > Desktop & Dock says.
+struct TitleBarArea: View {
+    let window: NSWindow?
+
+    var body: some View {
+        Color.clear
+            .contentShape(Rectangle())
+            .gesture(WindowDragGesture())
+            .simultaneousGesture(TapGesture(count: 2).onEnded {
+                switch UserDefaults.standard.string(forKey: "AppleActionOnDoubleClick") {
+                case "Minimize": window?.performMiniaturize(nil)
+                case "None": break
+                default: window?.performZoom(nil)
+                }
+            })
+    }
+}
+
+/// The strip between two panels: drag it to make the panel wider or narrower.
+struct ResizeHandle: View {
+    @Binding var width: Double
+    let range: ClosedRange<Double>
+    /// True for the sidebar, which grows when dragged right; false for the details pane.
+    let growsRight: Bool
+    @State private var start: Double?
+
+    var body: some View {
+        Color.clear
+            .frame(width: 10)
+            .contentShape(Rectangle())
+            .pointerStyle(.columnResize(directions: .all))
+            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                .onChanged { drag in
+                    let from = start ?? width
+                    start = from
+                    let delta = growsRight ? drag.translation.width : -drag.translation.width
+                    width = min(max(from + delta, range.lowerBound), range.upperBound)
+                }
+                .onEnded { _ in start = nil })
+            .help("Drag to resize")
     }
 }
 

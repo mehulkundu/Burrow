@@ -406,6 +406,9 @@ enum Places {
     var showDetails: Bool { didSet { defaults.set(showDetails, forKey: "showDetails") } }
     /// The navigation pane on the left (View > Show > Navigation pane in Explorer).
     var showSidebar: Bool { didSet { defaults.set(showSidebar, forKey: "showSidebar") } }
+    /// Panel widths, set by dragging their edges.
+    var sidebarWidth: Double { didSet { defaults.set(sidebarWidth, forKey: "sidebarWidth") } }
+    var detailsWidth: Double { didSet { defaults.set(detailsWidth, forKey: "detailsWidth") } }
     /// Search inside files too, as Explorer does in indexed folders.
     var searchContents: Bool { didSet { defaults.set(searchContents, forKey: "searchContents") } }
 
@@ -418,6 +421,8 @@ enum Places {
         iconView = defaults.bool(forKey: "iconView")
         showDetails = defaults.bool(forKey: "showDetails")
         showSidebar = defaults.object(forKey: "showSidebar") as? Bool ?? true
+        sidebarWidth = defaults.object(forKey: "sidebarWidth") as? Double ?? 236
+        detailsWidth = defaults.object(forKey: "detailsWidth") as? Double ?? 270
         searchContents = defaults.bool(forKey: "searchContents")
     }
 
