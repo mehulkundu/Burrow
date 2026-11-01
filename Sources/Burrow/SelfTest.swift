@@ -150,6 +150,60 @@ enum SelfTest {
             await b.trash([url("FILE-TEN.txt")!])
             check("Delete moves to the Trash", !exists("FILE-TEN.txt"))
 
+            // Undo (Ctrl+Z)
+            await b.undo()
+            check("Ctrl+Z brings a deleted file back from the Trash", exists("FILE-TEN.txt"))
+            await b.rename(url("FILE-TEN.txt")!, to: "ten.txt")
+            await b.undo()
+            check("Ctrl+Z undoes a rename", exists("FILE-TEN.txt") && !exists("ten.txt"))
+            let before = names().count
+            await b.newFolder()
+            b.renaming = nil
+            await b.undo()
+            check("Ctrl+Z removes a new folder", names().count == before)
+
+            // Batch rename
+            check("numbering names files like Explorer",
+                  Renamer.plan([("a.jpg", false), ("b.jpg", false), ("My.Folder", true)], find: "", replace: "", base: "Trip", start: 1)
+                    == ["Trip (1).jpg", "Trip (2).jpg", "Trip (3)"])
+            check("find and replace ignores case",
+                  Renamer.plan([("Report-OLD.txt", false)], find: "old", replace: "new", base: "", start: 1) == ["Report-new.txt"])
+            check("a rename that would clash is refused",
+                  Renamer.problem(["a", "b"], ["c", "c"], others: []) != nil
+                    && Renamer.problem(["a"], ["todo.md"], others: ["todo.md", "a"]) != nil
+                    && Renamer.problem(["a", "b"], ["b", "a"], others: ["a", "b"]) == nil)
+            let copies = names().filter { $0.hasPrefix("readme - Copy") }
+            await b.rename(copies.compactMap(url), to: ["note A.txt", "note B.txt"])
+            check("batch rename renames every file", exists("note A.txt") && exists("note B.txt"))
+            await b.undo()
+            check("one Ctrl+Z puts every name back", copies.count == 2 && copies.allSatisfy(exists))
+
+            // Zip
+            await b.compress([url("Photos")!])
+            check("Compress to ZIP makes Photos.zip", exists("Photos.zip"))
+            await b.extract(url("Photos.zip")!)
+            check("Extract All puts the one folder inside next to the archive", exists("Photos (2)/beach.jpg"))
+
+            // Tags
+            b.toggleTag("Red", on: [url("readme.txt")!])
+            await b.settle()
+            check("a tag shows on the file", b.rows.first { $0.name == "readme.txt" }?.tags == ["Red"])
+            b.toggleTag("Red", on: [url("readme.txt")!])
+            await b.settle()
+            check("tagging again takes it off", b.rows.first { $0.name == "readme.txt" }?.tags.isEmpty == true)
+
+            // Folder size and dual pane
+            let size = await FS.size(of: root.appending(path: "Photos"))
+            check("folder size adds up what is inside", size > 0)
+            let w = Workspace(start: root.path)
+            await w.left.settle()
+            w.toggleDual()
+            w.right?.go(.folder(docs.path))
+            await w.right?.settle()
+            w.left.selection = Set(w.left.rows.filter { $0.name == "readme.txt" }.map(\.url))
+            await w.sendAcross(move: false)
+            check("dual pane copies into the other pane's folder", exists("Documents/readme.txt") && exists("readme.txt"))
+
             // Search
             b.searchText = "report"
             await b.settle()

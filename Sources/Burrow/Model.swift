@@ -12,7 +12,11 @@ nonisolated struct FileItem: Identifiable, Hashable, Sendable {
     let url: URL
     let name: String
     let isFolder: Bool
+    /// Apps and other bundles: they open like files, and Show Package Contents goes in.
+    let isPackage: Bool
     let isHidden: Bool
+    /// Finder tags, shown as colored dots.
+    let tags: [String]
     /// -1 for folders, so they sort before every file.
     let size: Int64
     let modified: Date
@@ -23,7 +27,7 @@ nonisolated struct FileItem: Identifiable, Hashable, Sendable {
 /// File system work, off the main thread.
 nonisolated enum FS {
     static let keys: [URLResourceKey] = [.isDirectoryKey, .isPackageKey, .isSymbolicLinkKey, .isHiddenKey,
-                                          .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey]
+                                          .fileSizeKey, .contentModificationDateKey, .localizedTypeDescriptionKey, .tagNamesKey]
 
     static func item(_ url: URL) -> FileItem? {
         guard let v = try? url.resourceValues(forKeys: Set(keys)) else { return nil }
@@ -32,7 +36,8 @@ nonisolated enum FS {
         if v.isSymbolicLink == true, let target = try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) {
             isFolder = target.isDirectory == true && target.isPackage != true
         }
-        return FileItem(url: url, name: url.lastPathComponent, isFolder: isFolder, isHidden: v.isHidden == true,
+        return FileItem(url: url, name: url.lastPathComponent, isFolder: isFolder, isPackage: v.isPackage == true,
+                        isHidden: v.isHidden == true, tags: v.tagNames ?? [],
                         size: v.isDirectory == true ? -1 : Int64(v.fileSize ?? 0),
                         modified: v.contentModificationDate ?? .distantPast, kind: v.localizedTypeDescription ?? "")
     }
@@ -51,10 +56,10 @@ nonisolated enum FS {
     /// Copies or moves each item into `dest`. Never overwrites: a name that
     /// is taken gets " (2)", and a copy into its own folder gets " - Copy".
     /// Returns the names it created and the errors it hit.
-    @concurrent static func transfer(_ urls: [URL], to dest: URL, move: Bool) async -> (names: [String], errors: [String]) {
+    @concurrent static func transfer(_ urls: [URL], to dest: URL, move: Bool) async -> (done: [Moved], errors: [String]) {
         let fm = FileManager.default
         let destPath = dest.resolvingSymlinksInPath().path
-        var names: [String] = [], errors: [String] = []
+        var done: [Moved] = [], errors: [String] = []
         for src in urls {
             let srcPath = src.resolvingSymlinksInPath().path
             let sameFolder = (srcPath as NSString).deletingLastPathComponent == destPath
@@ -67,12 +72,120 @@ nonisolated enum FS {
             let target = uniqueURL(in: dest, name: src.lastPathComponent, isFolder: isDir, copy: sameFolder)
             do {
                 if move { try fm.moveItem(at: src, to: target) } else { try fm.copyItem(at: src, to: target) }
-                names.append(target.lastPathComponent)
+                done.append(Moved(from: src, to: target))
             } catch {
                 errors.append(error.localizedDescription)
             }
         }
-        return (names, errors)
+        return (done, errors)
+    }
+
+    /// Moves or renames, stepping through a temporary name when only the
+    /// case changes (a case-insensitive disk sees the new name as taken).
+    static func move(_ src: URL, to dst: URL) throws {
+        if src.lastPathComponent.lowercased() == dst.lastPathComponent.lowercased(),
+           src.deletingLastPathComponent() == dst.deletingLastPathComponent() {
+            let temp = src.deletingLastPathComponent().appending(path: ".\(UUID().uuidString)")
+            try FileManager.default.moveItem(at: src, to: temp)
+            try FileManager.default.moveItem(at: temp, to: dst)
+        } else {
+            try FileManager.default.moveItem(at: src, to: dst)
+        }
+    }
+
+    /// Reverses one recorded action. Never overwrites: a file back in its old place stops that step.
+    @concurrent static func undo(_ op: FileOp) async -> [String] {
+        let fm = FileManager.default
+        var errors: [String] = []
+        switch op {
+        case .moved(let pairs), .trashed(let pairs):
+            for pair in pairs.reversed() {
+                let caseOnly = pair.from.path.lowercased() == pair.to.path.lowercased()
+                if !caseOnly, fm.fileExists(atPath: pair.from.path) {
+                    errors.append("Something named \"\(pair.from.lastPathComponent)\" is already back in its old place.")
+                    continue
+                }
+                do { try move(pair.to, to: pair.from) } catch { errors.append(error.localizedDescription) }
+            }
+        case .created(let urls):
+            for url in urls {
+                do { try fm.trashItem(at: url, resultingItemURL: nil) } catch { errors.append(error.localizedDescription) }
+            }
+        }
+        return errors
+    }
+
+    /// Zips items that share a folder, named like Explorer's "Compress to ZIP file".
+    @concurrent static func zip(_ urls: [URL]) async -> (URL?, String?) {
+        guard let first = urls.first else { return (nil, nil) }
+        let dir = first.deletingLastPathComponent()
+        let isDir = (try? first.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+        let name = urls.count > 1 ? "Archive" : isDir ? first.lastPathComponent : first.deletingPathExtension().lastPathComponent
+        let target = uniqueURL(in: dir, name: name + ".zip", isFolder: false, copy: false)
+        let items = urls.filter { $0.deletingLastPathComponent() == dir }.map(\.lastPathComponent)
+        let error = run("/usr/bin/zip", ["-r", "-y", "-q", "-X", target.lastPathComponent] + items, in: dir)
+        return error == nil ? (target, nil) : (nil, error)
+    }
+
+    /// Extract All. A single folder or file inside lands next to the archive, as
+    /// Finder does; several items go into a new folder named after the archive.
+    @concurrent static func unzip(_ archive: URL) async -> (URL?, String?) {
+        let fm = FileManager.default
+        let dir = archive.deletingLastPathComponent()
+        // Our own scratch folder next to the archive, so the final move stays on one drive.
+        let scratch = dir.appending(path: ".burrow-extract-\(UUID().uuidString)")
+        if let error = run("/usr/bin/ditto", ["-x", "-k", archive.path, scratch.path], in: nil) {
+            try? fm.removeItem(at: scratch)
+            return (nil, error)
+        }
+        let inside = ((try? fm.contentsOfDirectory(at: scratch, includingPropertiesForKeys: nil)) ?? [])
+            .filter { $0.lastPathComponent != "__MACOSX" }
+        do {
+            if inside.count == 1 {
+                let isDir = (try? inside[0].resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true
+                let target = uniqueURL(in: dir, name: inside[0].lastPathComponent, isFolder: isDir, copy: false)
+                try fm.moveItem(at: inside[0], to: target)
+                try fm.removeItem(at: scratch)
+                return (target, nil)
+            }
+            let target = uniqueURL(in: dir, name: archive.deletingPathExtension().lastPathComponent, isFolder: true, copy: false)
+            try fm.moveItem(at: scratch, to: target)
+            return (target, nil)
+        } catch {
+            return (nil, error.localizedDescription)
+        }
+    }
+
+    /// Runs a command line tool; returns its error text, or nil when it worked.
+    private static func run(_ tool: String, _ arguments: [String], in dir: URL?) -> String? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: tool)
+        process.arguments = arguments
+        process.currentDirectoryURL = dir
+        let errors = Pipe()
+        process.standardError = errors
+        process.standardOutput = FileHandle.nullDevice
+        do { try process.run() } catch { return error.localizedDescription }
+        process.waitUntilExit()
+        if process.terminationStatus == 0 { return nil }
+        let text = String(decoding: errors.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        return text.isEmpty ? "\((tool as NSString).lastPathComponent) failed." : text
+    }
+
+    /// Everything inside a folder, as Properties counts it.
+    @concurrent static func size(of dir: URL) async -> Int64 {
+        guard let walker = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.totalFileAllocatedSizeKey],
+                                                          options: [], errorHandler: { _, _ in true }) else { return 0 }
+        var total: Int64 = 0
+        while !Task.isCancelled, let url = walker.nextObject() as? URL {
+            total += Int64((try? url.resourceValues(forKeys: [.totalFileAllocatedSizeKey]))?.totalFileAllocatedSize ?? 0)
+        }
+        return total
+    }
+
+    @concurrent static func eject(_ path: String) async -> String? {
+        do { try NSWorkspace.shared.unmountAndEjectDevice(at: URL(fileURLWithPath: path)) } catch { return error.localizedDescription }
+        return nil
     }
 
     static func uniqueURL(in dir: URL, name: String, isFolder: Bool, copy: Bool) -> URL {
@@ -98,8 +211,8 @@ nonisolated enum FS {
     /// Spotlight's answer for names containing `query` under `root`: the Mac's
     /// search index, as Explorer uses the Windows index. Hidden files and
     /// ~/Library are left out unless hidden items are shown, as AppData is on Windows.
-    @concurrent static func spotlight(_ root: URL, for query: String, hidden: Bool) async -> [FileItem] {
-        let paths = mdfind(["-onlyin", root.path, "-name", query], hidden: hidden, limit: 2000)
+    @concurrent static func spotlight(_ root: URL, for query: String, hidden: Bool, contents: Bool = false) async -> [FileItem] {
+        let paths = mdfind(["-onlyin", root.path] + (contents ? [query] : ["-name", query]), hidden: hidden, limit: 2000)
         return paths.compactMap { item(URL(fileURLWithPath: $0)) }.filter { hidden || !$0.isHidden }
     }
 
@@ -186,10 +299,64 @@ nonisolated struct RecentFile: Identifiable, Sendable {
 
 nonisolated struct Volume: Identifiable, Sendable {
     let path: String
+    var canEject: Bool { path.hasPrefix("/Volumes/") }
     let name: String
     let total: Int64
     let free: Int64
     var id: String { path }
+}
+
+nonisolated struct Moved: Sendable {
+    let from: URL
+    let to: URL
+}
+
+/// What Ctrl+Z can reverse.
+nonisolated enum FileOp: Sendable {
+    /// Moves and renames: each goes back.
+    case moved([Moved])
+    /// Copies, new items, archives: they go to the Trash.
+    case created([URL])
+    /// From where it was to the Trash: each comes back.
+    case trashed([Moved])
+}
+
+/// One undo history for every window, as in Explorer.
+@Observable final class History {
+    static let shared = History()
+    private(set) var ops: [FileOp] = []
+
+    func record(_ op: FileOp) {
+        ops.append(op)
+        if ops.count > 100 { ops.removeFirst() }
+    }
+
+    func pop() -> FileOp? { ops.popLast() }
+}
+
+/// New names for a multi-file rename.
+nonisolated enum Renamer {
+    /// Find and replace when `find` has text; otherwise "base (1).ext", "base (2).ext", as
+    /// Explorer does when you rename several files at once.
+    static func plan(_ items: [(name: String, isFolder: Bool)], find: String, replace: String, base: String, start: Int) -> [String] {
+        if !find.isEmpty {
+            return items.map { $0.name.replacingOccurrences(of: find, with: replace, options: .caseInsensitive) }
+        }
+        return items.enumerated().map { index, item in
+            let ext = item.isFolder ? "" : (item.name as NSString).pathExtension
+            return "\(base) (\(start + index))" + (ext.isEmpty ? "" : ".\(ext)")
+        }
+    }
+
+    /// Why a plan can't run, or nil when it can.
+    static func problem(_ old: [String], _ new: [String], others: Set<String>) -> String? {
+        if new.contains(where: { $0.trimmingCharacters(in: .whitespaces).isEmpty }) { return "Every name needs at least one character." }
+        if new.contains(where: { $0.contains("/") || $0.contains(":") }) { return "A file name can't contain / or :." }
+        if Set(new.map { $0.lowercased() }).count != new.count { return "Two files would get the same name." }
+        let taken = others.subtracting(old.map { $0.lowercased() })
+        if let clash = new.first(where: { taken.contains($0.lowercased()) }) { return "\"\(clash)\" is already in this folder." }
+        return nil
+    }
 }
 
 enum Places {
@@ -237,6 +404,8 @@ enum Places {
     /// Large icons instead of Details.
     var iconView: Bool { didSet { defaults.set(iconView, forKey: "iconView") } }
     var showDetails: Bool { didSet { defaults.set(showDetails, forKey: "showDetails") } }
+    /// Search inside files too, as Explorer does in indexed folders.
+    var searchContents: Bool { didSet { defaults.set(searchContents, forKey: "searchContents") } }
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
@@ -246,6 +415,7 @@ enum Places {
         showHidden = defaults.bool(forKey: "showHidden")
         iconView = defaults.bool(forKey: "iconView")
         showDetails = defaults.bool(forKey: "showDetails")
+        searchContents = defaults.bool(forKey: "searchContents")
     }
 
     func togglePin(_ path: String) {
@@ -278,6 +448,10 @@ enum Places {
     var sortOrder = [KeyPathComparator(\FileItem.name, comparator: .localizedStandard)] { didSet { resort() } }
     var searchText = "" { didSet { if searchText != oldValue { search() } } }
     var renaming: URL?
+    /// Several files picked for one rename (F2 with more than one selected).
+    var batchRenaming: [URL]?
+    /// The file Quick Look shows (Space).
+    var quickLook: URL?
     var editingAddress = false
     /// Bumped to move focus to the search field.
     var focusSearch = 0
@@ -394,6 +568,9 @@ enum Places {
         go(isVolume ? .thisMac : .folder(dir.deletingLastPathComponent().path))
     }
 
+    /// Opens at a place without adding to Back, for a new window or tab.
+    func start(at location: Location) { show(location) }
+
     private func show(_ location: Location) {
         self.location = location
         selection = []
@@ -492,6 +669,9 @@ enum Places {
 
     // MARK: Search
 
+    /// Runs the search again, after a search option changes.
+    func searchAgain() { search() }
+
     /// Explorer's search: the current folder and every subfolder (Home and
     /// This Mac search your home folder). Spotlight answers first; a folder
     /// Spotlight doesn't index is crawled instead.
@@ -505,13 +685,14 @@ enum Places {
         }
         let root = folder ?? URL.homeDirectory
         let hidden = prefs.showHidden
+        let contents = prefs.searchContents
         results = []
         selection = []
         isSearching = true
         searchTask = Task {
             try? await Task.sleep(for: .milliseconds(200))
             if Task.isCancelled { return }
-            let indexed = await FS.spotlight(root, for: query, hidden: hidden)
+            let indexed = await FS.spotlight(root, for: query, hidden: hidden, contents: contents)
             if Task.isCancelled { return }
             results = indexed
             if indexed.isEmpty {
@@ -581,7 +762,8 @@ enum Places {
         let result = await FS.transfer(urls, to: dest, move: move)
         status = nil
         if let error = result.errors.first { alert = error }
-        if dest.standardizedFileURL == folder?.standardizedFileURL { pendingSelect = Set(result.names) }
+        if !result.done.isEmpty { History.shared.record(move ? .moved(result.done) : .created(result.done.map(\.to))) }
+        if dest.standardizedFileURL == folder?.standardizedFileURL { pendingSelect = Set(result.done.map(\.to.lastPathComponent)) }
         await load()
     }
 
@@ -611,18 +793,12 @@ enum Places {
             return
         }
         do {
-            if caseOnly {
-                // A case-insensitive disk sees the new name as taken. Step through a temporary one.
-                let temp = url.deletingLastPathComponent().appending(path: ".\(UUID().uuidString)")
-                try FileManager.default.moveItem(at: url, to: temp)
-                try FileManager.default.moveItem(at: temp, to: target)
-            } else {
-                try FileManager.default.moveItem(at: url, to: target)
-            }
+            try FS.move(url, to: target)
         } catch {
             alert = error.localizedDescription
             return
         }
+        History.shared.record(.moved([Moved(from: url, to: target)]))
         pendingSelect = [name]
         await load()
     }
@@ -637,6 +813,7 @@ enum Places {
             alert = error.localizedDescription
             return
         }
+        History.shared.record(.created([url]))
         pendingSelect = [url.lastPathComponent]
         pendingRename = true
         await load()
@@ -650,6 +827,7 @@ enum Places {
             alert = "Couldn't make a file in this folder."
             return
         }
+        History.shared.record(.created([url]))
         pendingSelect = [url.lastPathComponent]
         pendingRename = true
         await load()
@@ -684,16 +862,102 @@ enum Places {
 
     /// Moves to the Trash, the Recycle Bin of the Mac.
     func trash(_ urls: Set<URL>) async {
+        var done: [Moved] = []
         for url in urls {
+            var inTrash: NSURL?
             do {
-                try FileManager.default.trashItem(at: url, resultingItemURL: nil)
+                try FileManager.default.trashItem(at: url, resultingItemURL: &inTrash)
+                if let inTrash { done.append(Moved(from: url, to: inTrash as URL)) }
             } catch {
                 alert = error.localizedDescription
                 break
             }
         }
+        if !done.isEmpty { History.shared.record(.trashed(done)) }
         Clip.shared.cut.subtract(urls)
         await load()
+    }
+
+    /// Ctrl+Z: reverses the last move, copy, rename, new item, or delete.
+    func undo() async {
+        guard let op = History.shared.pop() else { return }
+        let errors = await FS.undo(op)
+        if let error = errors.first { alert = "Couldn't undo everything. \(error)" }
+        await load()
+    }
+
+    /// Renames several files in one go; Ctrl+Z puts every name back.
+    func rename(_ urls: [URL], to names: [String]) async {
+        let others = Set(rows.map { $0.name.lowercased() })
+        if let problem = Renamer.problem(urls.map(\.lastPathComponent), names, others: others) {
+            alert = problem
+            return
+        }
+        // Through temporary names first, so swapping two names works.
+        var temps: [(URL, URL)] = []
+        var done: [Moved] = []
+        do {
+            for url in urls {
+                let temp = url.deletingLastPathComponent().appending(path: ".burrow-\(UUID().uuidString)")
+                try FileManager.default.moveItem(at: url, to: temp)
+                temps.append((url, temp))
+            }
+            for ((url, temp), name) in zip(temps, names) {
+                let target = url.deletingLastPathComponent().appending(path: name)
+                try FileManager.default.moveItem(at: temp, to: target)
+                done.append(Moved(from: url, to: target))
+            }
+        } catch {
+            alert = error.localizedDescription
+            // Put back what is still parked under a temporary name.
+            for (url, temp) in temps where FileManager.default.fileExists(atPath: temp.path) {
+                try? FileManager.default.moveItem(at: temp, to: url)
+            }
+        }
+        if !done.isEmpty { History.shared.record(.moved(done)) }
+        pendingSelect = Set(done.map(\.to.lastPathComponent))
+        await load()
+    }
+
+    func compress(_ urls: Set<URL>) async {
+        status = "Compressing…"
+        let (zip, error) = await FS.zip(rows.map(\.url).filter(urls.contains))
+        status = nil
+        if let error { alert = error }
+        if let zip {
+            History.shared.record(.created([zip]))
+            pendingSelect = [zip.lastPathComponent]
+        }
+        await load()
+    }
+
+    func extract(_ archive: URL) async {
+        status = "Extracting…"
+        let (folder, error) = await FS.unzip(archive)
+        status = nil
+        if let error { alert = error }
+        if let folder {
+            History.shared.record(.created([folder]))
+            pendingSelect = [folder.lastPathComponent]
+        }
+        await load()
+    }
+
+    /// Finder's colored tags: adds the tag, or takes it off when every item has it.
+    func toggleTag(_ tag: String, on urls: Set<URL>) {
+        let picked = rows.filter { urls.contains($0.url) }
+        let add = !picked.allSatisfy { $0.tags.contains(tag) }
+        for item in picked {
+            let tags = item.tags.filter { $0 != tag } + (add ? [tag] : [])
+            do { try (item.url as NSURL).setResourceValue(tags, forKey: .tagNamesKey) } catch { alert = error.localizedDescription }
+        }
+        reload()
+    }
+
+    /// F2: one item renames in place; several open the multi-rename sheet.
+    func renameSelection(_ urls: Set<URL>) {
+        let ordered = rows.map(\.url).filter(urls.contains)
+        if ordered.count == 1 { startRename(ordered[0]) } else if ordered.count > 1 { batchRenaming = ordered }
     }
 
     func openTerminal(_ dir: URL? = nil) {
@@ -758,8 +1022,11 @@ enum Places {
 
         switch event.keyCode {
         case 120 where mods.isEmpty || mods == [.control]:  // F2
-            if picked.count == 1, let url = picked.first { startRename(url) }
+            renameSelection(picked)
             return true
+        case 49 where mods.isEmpty && inList:  // Space: Quick Look, as in Finder
+            quickLook = quickLook == nil ? rows.first { picked.contains($0.url) }?.url : nil
+            return quickLook != nil || !picked.isEmpty
         case 96:  // F5
             reload(); return true
         case 99:  // F3
@@ -795,6 +1062,7 @@ enum Places {
 
         if ctrl && !alt {
             switch key {
+            case "z" where !History.shared.ops.isEmpty: Task { await undo() }; return true
             case "x" where !picked.isEmpty: copy(picked, cut: true); return true
             case "c" where !picked.isEmpty: shift ? copyPaths(picked) : copy(picked, cut: false); return true
             case "v" where folder != nil: Task { await paste() }; return true

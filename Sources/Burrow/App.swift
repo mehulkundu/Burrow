@@ -11,11 +11,11 @@ struct BurrowApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        WindowGroup("Burrow", id: "browser") {
-            BrowserView()
+        WindowGroup("Burrow", id: "browser", for: TabStart.self) { $start in
+            BrowserView(start: start?.path)
                 .frame(minWidth: 760, minHeight: 440)
         }
-        .defaultSize(width: 1180, height: 720)
+        .defaultSize(width: 1280, height: 760)
         // Explorer draws its own header row; the Mac title bar would be a second one.
         .windowStyle(.hiddenTitleBar)
         .commands {
@@ -34,17 +34,8 @@ struct FileCommands: Commands {
 
     var body: some Commands {
         CommandGroup(after: .newItem) {
-            Button("New Tab") {
-                let current = NSApp.keyWindow
-                openWindow(id: "browser")
-                // The new window is key on the next turn of the run loop. Tab it in.
-                DispatchQueue.main.async {
-                    guard let current, let new = NSApp.keyWindow, new !== current else { return }
-                    current.addTabbedWindow(new, ordered: .above)
-                    new.makeKeyAndOrderFront(nil)
-                }
-            }
-            .keyboardShortcut("t")
+            Button("New Tab") { Tabs.open(openWindow) }
+                .keyboardShortcut("t")
             Button("New Folder") { Task { await Browser.active?.newFolder() } }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
         }

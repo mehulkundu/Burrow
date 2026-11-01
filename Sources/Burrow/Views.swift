@@ -1,89 +1,203 @@
 import AppKit
-import QuickLookThumbnailing
+import QuickLook
 import SwiftUI
 
+/// One window: one pane, or two side by side (dual pane, as in ForkLift and
+/// Total Commander). The sidebar, the details panel, and the keys act on the active pane.
+@Observable final class Workspace {
+    let left: Browser
+    private(set) var right: Browser?
+    private(set) var rightActive = false
+    /// Where the right pane starts on the x axis, for picking the active pane on a click.
+    @ObservationIgnored var rightPaneX: CGFloat = .infinity
+
+    init(start: String?) {
+        left = Browser()
+        if let start { left.start(at: .folder(start)) }
+    }
+
+    var active: Browser { rightActive ? right ?? left : left }
+    var other: Browser? { right == nil ? nil : rightActive ? left : right }
+
+    func activate(right isRight: Bool) {
+        rightActive = isRight && right != nil
+        Browser.active = active
+    }
+
+    func toggleDual() {
+        if right == nil {
+            let pane = Browser()
+            pane.window = left.window
+            pane.start(at: left.location)
+            right = pane
+            // Two panes need a wide window; grow it, staying on the screen.
+            if let window = left.window, let screen = window.screen?.visibleFrame, window.frame.width < 1440 {
+                var frame = window.frame
+                frame.size.width = min(1440, screen.width)
+                frame.origin.x = max(screen.minX, min(frame.origin.x, screen.maxX - frame.width))
+                window.setFrame(frame, display: true, animate: true)
+            }
+        } else {
+            right = nil
+            activate(right: false)
+        }
+    }
+
+    /// Copies or moves the active pane's selection into the other pane's folder.
+    func sendAcross(move: Bool) async {
+        guard let other else { return }
+        guard let dest = other.folder else {
+            active.alert = "Open a folder in the other pane first."
+            return
+        }
+        let urls = active.rows.map(\.url).filter(active.selection.contains)
+        guard !urls.isEmpty else { return }
+        await active.transfer(urls, to: dest, move: move)
+        await other.load()
+    }
+
+    /// Keys for the whole window; everything else goes to the active pane.
+    func handle(_ event: NSEvent) -> Bool {
+        if event.type == .leftMouseDown {
+            if right != nil { activate(right: event.locationInWindow.x >= rightPaneX) }
+            return false
+        }
+        let mods = event.modifierFlags.intersection([.command, .control, .option, .shift])
+        if event.type == .keyDown, !(event.window?.firstResponder is NSText) {
+            if mods == [.shift], event.keyCode == 96 || event.keyCode == 97, right != nil {  // Shift+F5 copy, Shift+F6 move
+                Task { await sendAcross(move: event.keyCode == 97) }
+                return true
+            }
+            if mods == [.control, .shift] || mods == [.command, .shift], event.charactersIgnoringModifiers?.lowercased() == "d" {
+                toggleDual()
+                return true
+            }
+        }
+        return active.handle(event)
+    }
+}
+
 struct BrowserView: View {
-    @State private var model = Browser()
+    @State private var workspace: Workspace
     @State private var monitor: Any?
-    @FocusState private var contentFocused: Bool
+    @State private var window: NSWindow?
+    @Bindable private var prefs = Prefs.shared
+
+    init(start: String? = nil) {
+        _workspace = State(initialValue: Workspace(start: start))
+    }
 
     var body: some View {
+        let active = workspace.active
         NavigationSplitView {
-            Sidebar(model: model)
-                .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 380)
+            Sidebar(workspace: workspace)
+                .navigationSplitViewColumnWidth(min: 190, ideal: 230, max: 360)
                 .toolbar(removing: .sidebarToggle)
         } detail: {
-            VStack(spacing: 0) {
-                // Clicks on the bars never leave a focus ring behind.
-                Group {
-                    HeaderBar(model: model)
-                    CommandBar(model: model)
+            HStack(spacing: 0) {
+                PaneView(model: workspace.left, workspace: workspace, isActive: !workspace.rightActive)
+                if let right = workspace.right {
+                    Divider()
+                    PaneView(model: right, workspace: workspace, isActive: workspace.rightActive)
+                        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { workspace.rightPaneX = $0 }
                 }
-                .focusEffectDisabled()
-                Divider()
-                HStack(spacing: 0) {
-                    MainContent(model: model)
-                        .focused($contentFocused)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if model.prefs.showDetails {
-                        Divider()
-                        DetailsPane(model: model).frame(width: 270)
-                    }
+                if prefs.showDetails {
+                    // A floating glass panel, the right-hand twin of the sidebar.
+                    DetailsPane(model: active)
+                        .frame(width: 270)
+                        .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
+                        .padding(10)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
-                Divider()
-                StatusBar(model: model).focusEffectDisabled()
             }
+            .animation(.smooth(duration: 0.25), value: prefs.showDetails)
             .ignoresSafeArea(.container, edges: .top)
         }
-        .navigationTitle(model.title)
-        .background(WindowReader { window in
-            model.window = window
-            Browser.active = model
+        .navigationTitle(active.title)
+        .background(WindowReader { found in
+            window = found
+            workspace.left.window = found
+            workspace.right?.window = found
+            Browser.active = workspace.active
         })
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
-            if (note.object as? NSWindow) === model.window { Browser.active = model }
+            if (note.object as? NSWindow) === window { Browser.active = workspace.active }
+        }
+        // Folders dropped on the Dock icon, or `open -a Burrow <folder>`, open here
+        // instead of in a new window.
+        .handlesExternalEvents(preferring: ["*"], allowing: ["*"])
+        .onOpenURL { url in
+            if (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true { workspace.active.go(.folder(url.path)) }
         }
         .onAppear {
-            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .otherMouseDown]) { [model] event in
-                guard event.window === model.window else { return event }
-                return model.handle(event) ? nil : event
+            monitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .otherMouseDown, .leftMouseDown]) { [workspace] event in
+                guard event.window === workspace.left.window else { return event }
+                return workspace.handle(event) ? nil : event
             }
         }
         .onDisappear {
             if let monitor { NSEvent.removeMonitor(monitor) }
         }
-        .onChange(of: model.location) { contentFocused = true }
-        .onChange(of: model.prefs.showHidden) { model.resort() }
-        .alert("Burrow", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
-            Button("OK") {}
-        } message: {
-            Text(model.alert ?? "")
+        .onChange(of: prefs.showHidden) {
+            workspace.left.resort()
+            workspace.right?.resort()
         }
         .task {
             SelfTest.runIfRequested()
-            Snapshot.runIfRequested(model: model)
+            Snapshot.runIfRequested(model: workspace.left)
         }
     }
 }
 
-/// Search results show wherever you search from, Home and This Mac included.
-struct MainContent: View {
-    let model: Browser
+/// One file pane: glass bars floating over the files, which scroll underneath.
+struct PaneView: View {
+    @Bindable var model: Browser
+    let workspace: Workspace
+    let isActive: Bool
+    @FocusState private var contentFocused: Bool
 
     var body: some View {
-        if model.isSearchActive || model.folder != nil {
-            if model.prefs.iconView { IconGrid(model: model) } else { FileTable(model: model) }
-        } else if model.location == .home {
-            HomePage(model: model)
-        } else {
-            ThisMacPage(model: model)
-        }
+        let dual = workspace.right != nil
+        MainContent(model: model)
+            .focused($contentFocused)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .safeAreaInset(edge: .top, spacing: 0) {
+                GlassEffectContainer(spacing: 8) {
+                    VStack(spacing: 8) {
+                        HeaderBar(model: model, highlighted: dual && isActive)
+                        // Names on the commands only when the pane has room for them. ViewThatFits
+                        // picks from the space offered, so the bar can't feed back into the layout.
+                        ViewThatFits(in: .horizontal) {
+                            if !dual { CommandBar(model: model, workspace: workspace) }
+                            CommandBar(model: model, workspace: workspace, compact: true)
+                        }
+                    }
+                }
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+                .padding(.bottom, 6)
+                .focusEffectDisabled()
+            }
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                StatusBar(model: model).focusEffectDisabled()
+            }
+            .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+            .quickLookPreview($model.quickLook, in: model.rows.map(\.url))
+            .onChange(of: model.location) { contentFocused = true }
+            .alert("Burrow", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
+                Button("OK") {}
+            } message: {
+                Text(model.alert ?? "")
+            }
+            .sheet(isPresented: Binding(get: { model.batchRenaming != nil }, set: { if !$0 { model.batchRenaming = nil } })) {
+                if let urls = model.batchRenaming { BatchRenameSheet(model: model, urls: urls) }
+            }
     }
 }
 
 // MARK: Shared pieces
 
-/// Flat button that lights up under the pointer, like Explorer's toolbar buttons.
+/// Flat button that lights up under the pointer, sitting on glass.
 struct HoverStyle: ButtonStyle {
     var isOn = false
 
@@ -101,11 +215,10 @@ struct HoverStyle: ButtonStyle {
             configuration.label
                 .foregroundStyle(isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
                 .background {
-                    RoundedRectangle(cornerRadius: 6)
-                        .fill(isOn ? AnyShapeStyle(.tint.opacity(0.18))
-                              : AnyShapeStyle(.primary.opacity(configuration.isPressed ? 0.12 : hovering && isEnabled ? 0.07 : 0)))
+                    Capsule().fill(isOn ? AnyShapeStyle(.tint.opacity(0.22))
+                                   : AnyShapeStyle(.primary.opacity(configuration.isPressed ? 0.14 : hovering && isEnabled ? 0.08 : 0)))
                 }
-                .contentShape(RoundedRectangle(cornerRadius: 6))
+                .contentShape(Capsule())
                 .onHover { hovering = $0 }
         }
     }
@@ -122,7 +235,7 @@ struct IconButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 14))
-                .frame(width: 30, height: 28)
+                .frame(width: 32, height: 28)
         }
         .buttonStyle(HoverStyle(isOn: isOn))
         .help(help ?? title)
@@ -130,63 +243,35 @@ struct IconButton: View {
     }
 }
 
-/// The rounded field behind the address bar and the search box.
-struct FieldBackground: ViewModifier {
-    func body(content: Content) -> some View {
-        content
-            .frame(height: 32)
-            .background(RoundedRectangle(cornerRadius: 8).fill(.quinary))
-            .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.separator))
+/// Opens a window, then tabs it into the current one, as Ctrl+T does.
+enum Tabs {
+    static func open(_ openWindow: OpenWindowAction, path: String? = nil) {
+        let current = NSApp.keyWindow
+        if let path { openWindow(id: "browser", value: TabStart(path: path)) } else { openWindow(id: "browser") }
+        // The new window is key on the next turn of the run loop.
+        DispatchQueue.main.async {
+            guard let current, let new = NSApp.keyWindow, new !== current else { return }
+            current.addTabbedWindow(new, ordered: .above)
+            new.makeKeyAndOrderFront(nil)
+        }
     }
 }
 
-struct FileIcon: View {
-    let path: String
-    var size: CGFloat = 16
-
-    var body: some View {
-        Image(nsImage: NSWorkspace.shared.icon(forFile: path))
-            .resizable()
-            .frame(width: size, height: size)
-    }
-}
-
-/// A Quick Look thumbnail for pictures, PDFs, and videos; the file's icon otherwise.
-struct Thumb: View {
-    let url: URL
-    let size: CGFloat
-    @State private var image: CGImage?
-
-    var body: some View {
-        Group {
-            if let image {
-                Image(decorative: image, scale: 2).resizable().scaledToFit()
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-            } else {
-                Image(nsImage: NSWorkspace.shared.icon(forFile: url.path)).resizable().scaledToFit()
-            }
-        }
-        .frame(width: size, height: size)
-        .task(id: url) { image = await Thumb.load(url, size: size) }
-    }
-
-    static func load(_ url: URL, size: CGFloat) async -> CGImage? {
-        let request = QLThumbnailGenerator.Request(fileAt: url, size: CGSize(width: size, height: size),
-                                                   scale: 2, representationTypes: .thumbnail)
-        return await withCheckedContinuation { continuation in
-            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { thumbnail, _ in
-                continuation.resume(returning: thumbnail?.cgImage)
-            }
-        }
-    }
+/// What a new tab opens. The id keeps two tabs on one folder from merging into one.
+struct TabStart: Codable, Hashable {
+    var path: String
+    var id = UUID()
 }
 
 // MARK: Navigation pane
 
 struct Sidebar: View {
-    let model: Browser
+    let workspace: Workspace
+    /// Bumped when a drive comes or goes.
+    @State private var drives = 0
 
     var body: some View {
+        let model = workspace.active
         let selection = Binding<Location?>(get: { model.location }, set: { if let new = $0 { model.go(new) } })
         List(selection: selection) {
             Label("Home", systemImage: "house").tag(Location.home)
@@ -205,16 +290,27 @@ struct Sidebar: View {
                     .contextMenu { PlaceMenu(model: model, path: path) }
                 }
                 .onMove { model.prefs.pins.move(fromOffsets: $0, toOffset: $1) }
+                // Drop a folder between favorites to pin it there, as in Finder.
+                .dropDestination(for: URL.self) { urls, index in
+                    let folders = urls.filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true }
+                        .map(\.path).filter { !model.prefs.pins.contains($0) }
+                    model.prefs.pins.insert(contentsOf: folders, at: min(index, model.prefs.pins.count))
+                }
             }
             Section("Locations") {
                 Label("This Mac", systemImage: "desktopcomputer").tag(Location.thisMac)
-                ForEach(Places.volumes()) { FolderNode(path: $0.path, title: $0.name, model: model) }
+                ForEach(Places.volumes()) { volume in
+                    FolderNode(path: volume.path, title: volume.name, model: model, ejectable: volume.canEject)
+                }
                 if let iCloud = Places.iCloudDrive {
                     FolderNode(path: iCloud, title: "iCloud Drive", model: model)
                 }
             }
+            .id(drives)
         }
         .listStyle(.sidebar)
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in drives += 1 }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in drives += 1 }
     }
 }
 
@@ -223,6 +319,7 @@ struct FolderNode: View {
     let path: String
     var title: String?
     let model: Browser
+    var ejectable = false
     @State private var open = false
     @State private var children: [String] = []
 
@@ -230,7 +327,16 @@ struct FolderNode: View {
         DisclosureGroup(isExpanded: $open) {
             ForEach(children, id: \.self) { FolderNode(path: $0, model: model) }
         } label: {
-            Label { Text(title ?? Places.name(path)).lineLimit(1) } icon: { FileIcon(path: path) }
+            HStack(spacing: 4) {
+                Label { Text(title ?? Places.name(path)).lineLimit(1) } icon: { FileIcon(path: path) }
+                Spacer(minLength: 0)
+                if ejectable {
+                    Button("Eject \(title ?? Places.name(path))", systemImage: "eject.fill") {
+                        Task { if let error = await FS.eject(path) { model.alert = error } }
+                    }
+                    .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
+                }
+            }
                 .tag(Location.folder(path))
                 .dropDestination(for: URL.self) { urls, _ in
                     model.drop(urls, onto: URL(fileURLWithPath: path))
@@ -248,10 +354,12 @@ struct FolderNode: View {
 struct PlaceMenu: View {
     let model: Browser
     let path: String
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         let pinned = model.prefs.pins.contains(path)
         Button("Open", systemImage: "folder") { model.go(.folder(path)) }
+        Button("Open in new tab", systemImage: "plus.square.on.square") { Tabs.open(openWindow, path: path) }
         Button(pinned ? "Unpin from Favorites" : "Pin to Favorites", systemImage: pinned ? "pin.slash" : "pin") {
             model.prefs.togglePin(path)
         }
@@ -268,22 +376,29 @@ struct PlaceMenu: View {
 
 struct HeaderBar: View {
     @Bindable var model: Browser
+    var highlighted = false
 
     var body: some View {
-        HStack(spacing: 2) {
-            IconButton(title: "Back", symbol: "arrow.left", help: "Back (Alt+Left)") { model.goBack() }
-                .disabled(!model.canGoBack)
-            IconButton(title: "Forward", symbol: "arrow.right", help: "Forward (Alt+Right)") { model.goForward() }
-                .disabled(!model.canGoForward)
-            IconButton(title: "Up", symbol: "arrow.up", help: "Up to the parent folder (Alt+Up)") { model.goUp() }
-                .disabled(!model.canGoUp)
-            IconButton(title: "Refresh", symbol: "arrow.clockwise", help: "Refresh (F5)") { model.reload() }
-            AddressBar(model: model).padding(.leading, 6)
-            SearchBox(model: model).frame(width: 260).padding(.leading, 6)
+        HStack(spacing: 8) {
+            HStack(spacing: 0) {
+                IconButton(title: "Back", symbol: "arrow.left", help: "Back (Alt+Left)") { model.goBack() }
+                    .disabled(!model.canGoBack)
+                IconButton(title: "Forward", symbol: "arrow.right", help: "Forward (Alt+Right)") { model.goForward() }
+                    .disabled(!model.canGoForward)
+                IconButton(title: "Up", symbol: "arrow.up", help: "Up to the parent folder (Alt+Up)") { model.goUp() }
+                    .disabled(!model.canGoUp)
+                IconButton(title: "Refresh", symbol: "arrow.clockwise", help: "Refresh (F5)") { model.reload() }
+            }
+            .padding(4)
+            .glassEffect(.regular, in: .capsule)
+            AddressBar(model: model)
+                .glassEffect(.regular.tint(highlighted ? .accentColor.opacity(0.18) : nil), in: .capsule)
+            // The search box takes its width first; the address bar folds folders into "…" to fit.
+            SearchBox(model: model)
+                .frame(minWidth: 120, idealWidth: 240, maxWidth: 240)
+                .glassEffect(.regular, in: .capsule)
+                .layoutPriority(1)
         }
-        .padding(.horizontal, 10)
-        .padding(.top, 10)
-        .frame(height: 52)
         .background { Color.clear.contentShape(Rectangle()).gesture(WindowDragGesture()) }
     }
 }
@@ -295,7 +410,7 @@ struct AddressBar: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            locationIcon.padding(.leading, 10).padding(.trailing, 4)
+            locationIcon.padding(.leading, 12).padding(.trailing, 4)
             if model.editingAddress {
                 TextField("Address", text: $text)
                     .textFieldStyle(.plain)
@@ -310,23 +425,14 @@ struct AddressBar: View {
                     }
                     .onExitCommand { model.editingAddress = false }
                     .onChange(of: focused) { if !focused { model.editingAddress = false } }
-                    .padding(.trailing, 10)
+                    .padding(.trailing, 12)
             } else {
+                // Long paths fold their first folders into "…", as Explorer does.
                 let crumbs = model.crumbs
-                ForEach(Array(crumbs.enumerated()), id: \.offset) { index, crumb in
-                    if index > 0 { SubfolderMenu(model: model, parent: crumbs[index - 1].location) }
-                    Button { model.go(crumb.location) } label: {
-                        Text(crumb.title).lineLimit(1).padding(.horizontal, 6).frame(height: 24)
-                    }
-                    .buttonStyle(HoverStyle())
-                    // The last folders keep their names; the first ones shorten first.
-                    .layoutPriority(Double(index))
-                }
-                if model.isSearchActive {
-                    Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
-                        .padding(.horizontal, 4)
-                    Text("Search Results in \(model.title)").lineLimit(1).padding(.horizontal, 6)
-                        .layoutPriority(100)
+                ViewThatFits(in: .horizontal) {
+                    CrumbRow(model: model, crumbs: crumbs[...])
+                    if crumbs.count > 3 { CrumbRow(model: model, crumbs: crumbs.suffix(3), hidden: crumbs.dropLast(3)) }
+                    if crumbs.count > 1 { CrumbRow(model: model, crumbs: crumbs.suffix(1), hidden: crumbs.dropLast(1)) }
                 }
                 Color.clear
                     .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
@@ -334,7 +440,7 @@ struct AddressBar: View {
                     .onTapGesture { model.editingAddress = true }
             }
         }
-        .modifier(FieldBackground())
+        .frame(height: 36)
         .help("Click empty space to type a path (Ctrl+L)")
     }
 
@@ -344,6 +450,47 @@ struct AddressBar: View {
         case .thisMac: Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
         case .folder(let path): FileIcon(path: path)
         }
+    }
+}
+
+typealias Crumb = (title: String, location: Location)
+
+struct CrumbRow: View {
+    let model: Browser
+    let crumbs: ArraySlice<Crumb>
+    var hidden: ArraySlice<Crumb> = []
+
+    var body: some View {
+        HStack(spacing: 0) {
+            if let last = hidden.last {
+                Menu {
+                    ForEach(Array(hidden.enumerated()), id: \.offset) { _, crumb in
+                        Button(crumb.title) { model.go(crumb.location) }
+                    }
+                } label: {
+                    Text("…").padding(.horizontal, 7).frame(height: 26)
+                }
+                .menuStyle(.button)
+                .menuIndicator(.hidden)
+                .buttonStyle(HoverStyle())
+                .accessibilityLabel("Earlier folders")
+                SubfolderMenu(model: model, parent: last.location)
+            }
+            ForEach(Array(crumbs.enumerated()), id: \.offset) { index, crumb in
+                if index > 0 { SubfolderMenu(model: model, parent: crumbs[crumbs.startIndex + index - 1].location) }
+                Button { model.go(crumb.location) } label: {
+                    Text(crumb.title).padding(.horizontal, 7).frame(height: 26)
+                }
+                .buttonStyle(HoverStyle())
+            }
+            if model.isSearchActive {
+                Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
+                    .padding(.horizontal, 4)
+                Text("Search Results in \(model.title)").padding(.horizontal, 6)
+            }
+        }
+        .lineLimit(1)
+        .fixedSize()
     }
 }
 
@@ -373,6 +520,7 @@ struct SubfolderMenu: View {
         } label: {
             Image(systemName: "chevron.right").font(.system(size: 10, weight: .semibold)).foregroundStyle(.tertiary)
         }
+        .accessibilityLabel("Folders inside")
         .menuStyle(.button)
         .menuIndicator(.hidden)
         .buttonStyle(HoverStyle())
@@ -398,16 +546,28 @@ struct SearchBox: View {
             if model.isSearching {
                 ProgressView().controlSize(.small)
             }
-            if model.searchText.isEmpty {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
-            } else {
+            if !model.searchText.isEmpty {
                 Button("Clear search", systemImage: "xmark.circle.fill") { model.searchText = "" }
                     .labelStyle(.iconOnly).buttonStyle(.plain).foregroundStyle(.secondary)
             }
+            Menu {
+                Toggle("Search file contents", isOn: Bindable(model.prefs).searchContents)
+                Toggle("Include hidden items", isOn: Bindable(model.prefs).showHidden)
+            } label: {
+                Image(systemName: model.prefs.searchContents ? "doc.text.magnifyingglass" : "magnifyingglass")
+                    .foregroundStyle(.secondary)
+            }
+            .menuStyle(.button)
+            .menuIndicator(.hidden)
+            .buttonStyle(.plain)
+            .fixedSize()
+            .help("Search options")
         }
-        .padding(.horizontal, 10)
-        .modifier(FieldBackground())
+        .padding(.leading, 14)
+        .padding(.trailing, 12)
+        .frame(height: 36)
         .onChange(of: model.focusSearch) { focused = true }
+        .onChange(of: model.prefs.searchContents) { model.searchAgain() }
     }
 }
 
@@ -415,562 +575,145 @@ struct SearchBox: View {
 
 struct CommandBar: View {
     @Bindable var model: Browser
+    let workspace: Workspace
+    var compact = false
 
     var body: some View {
         let picked = model.selection
         let inFolder = model.folder != nil
-        HStack(spacing: 2) {
-            Menu {
-                Button("Folder", systemImage: "folder") { Task { await model.newFolder() } }
-                Button("Text Document", systemImage: "doc.text") { Task { await model.newTextDocument() } }
-            } label: {
-                Label("New", systemImage: "plus.circle.fill").labelStyle(.titleAndIcon).padding(.horizontal, 8).frame(height: 28)
-            }
-            .disabled(!inFolder)
-            .help("New folder (Ctrl+Shift+N)")
-            separator
-            IconButton(title: "Cut", symbol: "scissors", help: "Cut (Ctrl+X)") { model.copy(picked, cut: true) }
+        HStack(spacing: 8) {
+            HStack(spacing: 0) {
+                Menu {
+                    Button("Folder", systemImage: "folder") { Task { await model.newFolder() } }
+                    Button("Text Document", systemImage: "doc.text") { Task { await model.newTextDocument() } }
+                } label: {
+                    TitledIcon(title: "New", symbol: "plus.circle.fill", compact: compact)
+                }
+                .disabled(!inFolder)
+                .help("New folder (Ctrl+Shift+N)")
+                separator
+                IconButton(title: "Cut", symbol: "scissors", help: "Cut (Ctrl+X)") { model.copy(picked, cut: true) }
+                    .disabled(picked.isEmpty)
+                IconButton(title: "Copy", symbol: "doc.on.doc", help: "Copy (Ctrl+C)") { model.copy(picked, cut: false) }
+                    .disabled(picked.isEmpty)
+                IconButton(title: "Paste", symbol: "doc.on.clipboard", help: "Paste (Ctrl+V)") { Task { await model.paste() } }
+                    .disabled(!model.canPaste)
+                IconButton(title: "Rename", symbol: "character.cursor.ibeam", help: "Rename (F2); several at once for a batch rename") {
+                    model.renameSelection(picked)
+                }
                 .disabled(picked.isEmpty)
-            IconButton(title: "Copy", symbol: "doc.on.doc", help: "Copy (Ctrl+C)") { model.copy(picked, cut: false) }
-                .disabled(picked.isEmpty)
-            IconButton(title: "Paste", symbol: "doc.on.clipboard", help: "Paste (Ctrl+V)") { Task { await model.paste() } }
-                .disabled(!model.canPaste)
-            IconButton(title: "Rename", symbol: "character.cursor.ibeam", help: "Rename (F2)") {
-                if let url = picked.first { model.startRename(url) }
-            }
-            .disabled(picked.count != 1)
-            ShareLink(items: model.selectedItems.map(\.url)) {
-                Image(systemName: "square.and.arrow.up").font(.system(size: 14)).frame(width: 30, height: 28)
-            }
-            .buttonStyle(HoverStyle())
-            .disabled(picked.isEmpty)
-            .help("Share")
-            IconButton(title: "Delete", symbol: "trash", help: "Move to Trash (Delete)") { Task { await model.trash(picked) } }
-                .disabled(picked.isEmpty)
-            separator
-            Menu {
-                Picker("Sort by", selection: $model.sortColumn) {
-                    ForEach(["Name", "Date modified", "Type", "Size"], id: \.self) { Text($0).tag($0) }
+                if !compact {
+                    ShareLink(items: model.selectedItems.map(\.url)) {
+                        Image(systemName: "square.and.arrow.up").font(.system(size: 14)).frame(width: 32, height: 28)
+                    }
+                    .buttonStyle(HoverStyle())
+                    .disabled(picked.isEmpty)
+                    .help("Share")
                 }
-                .pickerStyle(.inline)
-                Picker("Order", selection: $model.sortAscending) {
-                    Text("Ascending").tag(true)
-                    Text("Descending").tag(false)
+                IconButton(title: "Delete", symbol: "trash", help: "Move to Trash (Delete)") { Task { await model.trash(picked) } }
+                    .disabled(picked.isEmpty)
+                if !compact {
+                    IconButton(title: "Undo", symbol: "arrow.uturn.backward", help: "Undo (Ctrl+Z)") { Task { await model.undo() } }
+                        .disabled(History.shared.ops.isEmpty)
                 }
-                .pickerStyle(.inline)
-            } label: {
-                Label("Sort", systemImage: "arrow.up.arrow.down").labelStyle(.titleAndIcon).padding(.horizontal, 8).frame(height: 28)
-            }
-            Menu {
-                Picker("Layout", selection: Bindable(model.prefs).iconView) {
-                    Label("Large icons", systemImage: "square.grid.2x2").tag(true)
-                    Label("Details", systemImage: "list.bullet").tag(false)
+                separator
+                Menu {
+                    Picker("Sort by", selection: $model.sortColumn) {
+                        ForEach(["Name", "Date modified", "Type", "Size"], id: \.self) { Text($0).tag($0) }
+                    }
+                    .pickerStyle(.inline)
+                    Picker("Order", selection: $model.sortAscending) {
+                        Text("Ascending").tag(true)
+                        Text("Descending").tag(false)
+                    }
+                    .pickerStyle(.inline)
+                } label: {
+                    TitledIcon(title: "Sort", symbol: "arrow.up.arrow.down", compact: compact)
                 }
-                .pickerStyle(.inline)
-                Section("Show") {
-                    Toggle("Details pane", isOn: Bindable(model.prefs).showDetails)
-                    Toggle("Hidden items", isOn: Bindable(model.prefs).showHidden)
+                Menu {
+                    Picker("Layout", selection: Bindable(model.prefs).iconView) {
+                        Label("Large icons", systemImage: "square.grid.2x2").tag(true)
+                        Label("Details", systemImage: "list.bullet").tag(false)
+                    }
+                    .pickerStyle(.inline)
+                    Section("Show") {
+                        Toggle("Details pane", isOn: Bindable(model.prefs).showDetails)
+                        Toggle("Hidden items", isOn: Bindable(model.prefs).showHidden)
+                        Toggle("Dual pane", isOn: Binding(get: { workspace.right != nil }, set: { _ in workspace.toggleDual() }))
+                    }
+                } label: {
+                    TitledIcon(title: "View", symbol: "rectangle.grid.1x2", compact: compact)
                 }
-            } label: {
-                Label("View", systemImage: "rectangle.grid.1x2").labelStyle(.titleAndIcon).padding(.horizontal, 8).frame(height: 28)
-            }
-            Menu {
-                Button("Select all", systemImage: "checkmark.circle") { model.selectAll() }
-                Button("Select none", systemImage: "circle") { model.selection = [] }
-                Button("Invert selection", systemImage: "circle.lefthalf.filled") { model.invertSelection() }
-                if let dir = model.folder {
+                Menu {
+                    Button("Undo", systemImage: "arrow.uturn.backward") { Task { await model.undo() } }
+                        .disabled(History.shared.ops.isEmpty)
+                    ShareLink("Share", items: model.selectedItems.map(\.url))
+                        .disabled(picked.isEmpty)
                     Divider()
-                    PlaceMenu(model: model, path: dir.path)
+                    Button("Select all", systemImage: "checkmark.circle") { model.selectAll() }
+                    Button("Select none", systemImage: "circle") { model.selection = [] }
+                    Button("Invert selection", systemImage: "circle.lefthalf.filled") { model.invertSelection() }
+                    if let dir = model.folder {
+                        Divider()
+                        PlaceMenu(model: model, path: dir.path)
+                    }
+                } label: {
+                    Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 32, height: 28)
                 }
-            } label: {
-                Image(systemName: "ellipsis").font(.system(size: 14)).frame(width: 30, height: 28)
+                .help("See more")
             }
-            .help("See more")
-            Spacer()
-            Button { model.prefs.showDetails.toggle() } label: {
-                Label("Details", systemImage: "sidebar.right").labelStyle(.titleAndIcon).padding(.horizontal, 8).frame(height: 28)
+            .padding(4)
+            .glassEffect(.regular, in: .capsule)
+            .fixedSize()
+            Spacer(minLength: 0)
+            HStack(spacing: 0) {
+                if workspace.right != nil {
+                    let toRight = !workspace.rightActive
+                    IconButton(title: "Copy to other pane", symbol: toRight ? "arrow.right.doc.on.clipboard" : "arrow.left.doc.on.clipboard",
+                               help: "Copy to the other pane (Shift+F5)") { Task { await workspace.sendAcross(move: false) } }
+                        .disabled(picked.isEmpty)
+                    IconButton(title: "Move to other pane", symbol: toRight ? "arrow.right.square" : "arrow.left.square",
+                               help: "Move to the other pane (Shift+F6)") { Task { await workspace.sendAcross(move: true) } }
+                        .disabled(picked.isEmpty)
+                }
+                IconButton(title: "Dual pane", symbol: "rectangle.split.2x1", help: "Dual pane (Ctrl+Shift+D)",
+                           isOn: workspace.right != nil) { workspace.toggleDual() }
+                Button { model.prefs.showDetails.toggle() } label: {
+                    TitledIcon(title: "Details", symbol: "sidebar.right", compact: compact)
+                }
+                .buttonStyle(HoverStyle(isOn: model.prefs.showDetails))
+                .help("Details pane (Alt+Shift+P)")
             }
-            .buttonStyle(HoverStyle(isOn: model.prefs.showDetails))
-            .help("Details pane (Alt+Shift+P)")
+            .padding(4)
+            .glassEffect(.regular, in: .capsule)
+            .fixedSize()
         }
         .menuStyle(.button)
         .menuIndicator(.hidden)
         .buttonStyle(HoverStyle())
-        .padding(.horizontal, 10)
-        .frame(height: 40)
     }
 
     private var separator: some View {
-        Divider().frame(height: 20).padding(.horizontal, 6)
+        Divider().frame(height: 18).padding(.horizontal, 6)
     }
 }
 
-// MARK: Details view
-
-struct FileTable: View {
-    @Bindable var model: Browser
-
-    var body: some View {
-        Table(of: FileItem.self, selection: $model.selection, sortOrder: $model.sortOrder) {
-            TableColumn("Name", value: \.name) { item in
-                NameCell(item: item, model: model)
-            }
-            .width(min: 180, ideal: 320)
-            TableColumn("Date modified", value: \.modified) { item in
-                Text(item.modified.formatted(date: .numeric, time: .shortened)).foregroundStyle(.secondary)
-            }
-            .width(min: 110, ideal: 150)
-            TableColumn("Type", value: \.kind) { item in
-                Text(item.kind).foregroundStyle(.secondary)
-            }
-            .width(min: 80, ideal: 140)
-            TableColumn("Size", value: \.size) { item in
-                Text(item.isFolder ? "" : item.size.formatted(.byteCount(style: .file)))
-                    .monospacedDigit()
-                    .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-            .width(min: 60, ideal: 90)
-        } rows: {
-            ForEach(model.rows) { item in
-                TableRow(item)
-                    .itemProvider { NSItemProvider(contentsOf: item.url) }
-                    .dropDestination(for: URL.self) { urls in
-                        model.drop(urls, onto: item.isFolder ? item.url : nil)
-                    }
-            }
-        }
-        .tableStyle(.inset)
-        .alternatingRowBackgrounds(.disabled)
-        .contextMenu(forSelectionType: URL.self) { ids in
-            ItemMenu(model: model, ids: ids)
-        } primaryAction: { ids in
-            model.open(ids)
-        }
-        .dropDestination(for: URL.self) { urls, _ in
-            model.drop(urls, onto: nil)
-            return true
-        }
-        .overlay { EmptyState(model: model) }
-    }
-}
-
-struct EmptyState: View {
-    let model: Browser
-
-    var body: some View {
-        if model.rows.isEmpty {
-            if let error = model.loadError {
-                ContentUnavailableView("Can't open this folder", systemImage: "lock", description: Text(error))
-            } else if model.isSearchActive {
-                if !model.isSearching {
-                    ContentUnavailableView.search(text: model.searchText)
-                }
-            } else {
-                Text("This folder is empty.").foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-
-struct NameCell: View {
-    let item: FileItem
-    let model: Browser
-
-    var body: some View {
-        HStack(spacing: 8) {
-            FileIcon(path: item.url.path, size: 18)
-            if model.renaming == item.url {
-                RenameField(item: item, model: model)
-            } else {
-                // The name keeps its room; the folder after it shortens first.
-                Text(item.name).lineLimit(1).truncationMode(.middle).layoutPriority(1)
-                if model.isSearchActive {
-                    Text(item.url.deletingLastPathComponent().path.replacingOccurrences(of: URL.homeDirectory.path, with: "~"))
-                        .foregroundStyle(.tertiary).lineLimit(1).truncationMode(.head)
-                }
-            }
-        }
-        .padding(.vertical, 3)
-        // Cut and hidden items look faded, as in Explorer.
-        .opacity(Clip.shared.cut.contains(item.url) || item.isHidden ? 0.5 : 1)
-    }
-}
-
-struct RenameField: View {
-    let item: FileItem
-    let model: Browser
-    @State private var text = ""
-    @FocusState private var focused: Bool
-
-    var body: some View {
-        TextField("Name", text: $text)
-            .textFieldStyle(.roundedBorder)
-            .focused($focused)
-            .onAppear {
-                text = item.name
-                focused = true
-            }
-            .onSubmit { model.finishRename(item.url, to: text) }
-            .onExitCommand { model.renaming = nil }
-            .onChange(of: focused) { if !focused { model.finishRename(item.url, to: text) } }
-    }
-}
-
-// MARK: Icons view
-
-struct IconGrid: View {
-    let model: Browser
-    private let tile: CGFloat = 112
-
-    var body: some View {
-        GeometryReader { geometry in
-            let columns = max(1, Int((geometry.size.width - 24 + 8) / (tile + 8)))
-            ScrollView {
-                LazyVGrid(columns: Array(repeating: GridItem(.fixed(tile), spacing: 8), count: columns),
-                          alignment: .leading, spacing: 8) {
-                    ForEach(model.rows) { IconTile(item: $0, model: model, size: tile) }
-                }
-                .padding(12)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            }
-            .contentShape(Rectangle())
-            .onTapGesture { model.selection = [] }
-            .contextMenu { ItemMenu(model: model, ids: []) }
-            .dropDestination(for: URL.self) { urls, _ in
-                model.drop(urls, onto: nil)
-                return true
-            }
-            .onAppear { model.gridColumns = columns }
-            .onChange(of: columns) { model.gridColumns = columns }
-        }
-        .focusable()
-        .focusEffectDisabled()
-        .overlay { EmptyState(model: model) }
-    }
-}
-
-struct IconTile: View {
-    let item: FileItem
-    let model: Browser
-    let size: CGFloat
-    @State private var hovering = false
-
-    var body: some View {
-        let selected = model.selection.contains(item.url)
-        VStack(spacing: 6) {
-            Thumb(url: item.url, size: 64)
-            if model.renaming == item.url {
-                RenameField(item: item, model: model)
-            } else {
-                Text(item.name)
-                    .font(.callout)
-                    .lineLimit(2)
-                    .multilineTextAlignment(.center)
-                    .truncationMode(.middle)
-            }
-        }
-        .padding(8)
-        .frame(width: size, height: size, alignment: .top)
-        .background {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(selected ? AnyShapeStyle(.tint.opacity(0.22)) : AnyShapeStyle(.primary.opacity(hovering ? 0.06 : 0)))
-        }
-        .overlay {
-            if selected { RoundedRectangle(cornerRadius: 8).strokeBorder(.tint.opacity(0.5)) }
-        }
-        .opacity(Clip.shared.cut.contains(item.url) || item.isHidden ? 0.5 : 1)
-        .contentShape(Rectangle())
-        .onHover { hovering = $0 }
-        .onTapGesture {
-            // One handler, so a single click selects at once and a double click opens.
-            if (NSApp.currentEvent?.clickCount ?? 1) >= 2 {
-                model.open([item.url])
-            } else {
-                let flags = NSEvent.modifierFlags
-                model.click(item.url, command: flags.contains(.command), shift: flags.contains(.shift))
-            }
-        }
-        .contextMenu { ItemMenu(model: model, ids: selected ? model.selection : [item.url]) }
-        .onDrag { NSItemProvider(contentsOf: item.url) ?? NSItemProvider() }
-        .dropDestination(for: URL.self) { urls, _ in
-            model.drop(urls, onto: item.isFolder ? item.url : nil)
-            return true
-        }
-    }
-}
-
-/// The right-click menu, on items or on empty space.
-struct ItemMenu: View {
-    let model: Browser
-    let ids: Set<URL>
-
-    var body: some View {
-        if ids.isEmpty {
-            Menu("New") {
-                Button("Folder", systemImage: "folder") { Task { await model.newFolder() } }
-                Button("Text Document", systemImage: "doc.text") { Task { await model.newTextDocument() } }
-            }
-            Button("Paste", systemImage: "doc.on.clipboard") { Task { await model.paste() } }.disabled(!model.canPaste)
-            Divider()
-            Picker("View", selection: Bindable(model.prefs).iconView) {
-                Text("Large icons").tag(true)
-                Text("Details").tag(false)
-            }
-            Button("Refresh", systemImage: "arrow.clockwise") { model.reload() }
-            Toggle("Show hidden items", isOn: Bindable(model.prefs).showHidden)
-            Divider()
-            Button("Open in Terminal", systemImage: "terminal") { model.openTerminal() }
-        } else {
-            let picked = model.rows.filter { ids.contains($0.url) }
-            let folder = picked.count == 1 && picked[0].isFolder ? picked[0].url : nil
-            Button("Open") { model.open(ids) }
-            if picked.count == 1, !picked[0].isFolder {
-                Menu("Open with") {
-                    ForEach(NSWorkspace.shared.urlsForApplications(toOpen: picked[0].url), id: \.self) { app in
-                        Button(FileManager.default.displayName(atPath: app.path)) {
-                            NSWorkspace.shared.open([picked[0].url], withApplicationAt: app, configuration: NSWorkspace.OpenConfiguration())
-                        }
-                    }
-                }
-            }
-            Divider()
-            Button("Cut", systemImage: "scissors") { model.copy(ids, cut: true) }
-            Button("Copy", systemImage: "doc.on.doc") { model.copy(ids, cut: false) }
-            if let folder {
-                Button("Paste into folder", systemImage: "doc.on.clipboard") { Task { await model.paste(into: folder) } }
-                    .disabled(!model.canPaste)
-            }
-            Button("Rename", systemImage: "character.cursor.ibeam") { if let url = ids.first { model.startRename(url) } }
-                .disabled(ids.count != 1)
-            Button("Delete", systemImage: "trash") { Task { await model.trash(ids) } }
-            Divider()
-            Button("Copy as path", systemImage: "link") { model.copyPaths(ids) }
-            if let folder {
-                let pinned = model.prefs.pins.contains(folder.path)
-                Button(pinned ? "Unpin from Favorites" : "Pin to Favorites", systemImage: pinned ? "pin.slash" : "pin") {
-                    model.prefs.togglePin(folder.path)
-                }
-                Button("Open in Terminal", systemImage: "terminal") { model.openTerminal(folder) }
-            }
-            if model.isSearchActive {
-                Button("Open file location", systemImage: "folder") {
-                    if let first = picked.first { model.go(.folder(first.url.deletingLastPathComponent().path)) }
-                }
-            }
-            Button("Show in Finder", systemImage: "finder") {
-                NSWorkspace.shared.activateFileViewerSelecting(picked.map(\.url))
-            }
-            Divider()
-            Button("Properties", systemImage: "info.circle") {
-                model.selection = ids
-                model.prefs.showDetails = true
-            }
-        }
-    }
-}
-
-// MARK: Details pane
-
-struct DetailsPane: View {
-    let model: Browser
-
-    var body: some View {
-        let picked = model.selectedItems
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                if picked.count == 1, let item = picked[0] as FileItem? {
-                    Thumb(url: item.url, size: 150).frame(maxWidth: .infinity)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.name).font(.title3.weight(.semibold)).textSelection(.enabled)
-                        Text(item.kind).foregroundStyle(.secondary)
-                    }
-                    Divider()
-                    Text("Properties").font(.headline)
-                    Properties(url: item.url, isFolder: item.isFolder)
-                } else if picked.count > 1 {
-                    Image(systemName: "doc.on.doc").font(.system(size: 56, weight: .thin)).foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity).padding(.vertical, 24)
-                    Text("\(picked.count) items selected").font(.title3.weight(.semibold))
-                    let bytes = picked.filter { !$0.isFolder }.reduce(Int64(0)) { $0 + $1.size }
-                    if bytes > 0 { Text(bytes.formatted(.byteCount(style: .file))).foregroundStyle(.secondary) }
-                } else if let dir = model.folder {
-                    FileIcon(path: dir.path, size: 96).frame(maxWidth: .infinity).padding(.vertical, 12)
-                    Text(model.title).font(.title3.weight(.semibold))
-                    Text("^[\(model.rows.count) item](inflect: true)").foregroundStyle(.secondary)
-                    Divider()
-                    Properties(url: dir, isFolder: true)
-                } else {
-                    Text("Select a file to see its details.").foregroundStyle(.secondary)
-                        .frame(maxWidth: .infinity).padding(.top, 40)
-                }
-            }
-            .padding(16)
-        }
-    }
-}
-
-struct Properties: View {
-    let url: URL
-    let isFolder: Bool
-
-    var body: some View {
-        let values = try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey, .creationDateKey])
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: 12, verticalSpacing: 8) {
-            if isFolder {
-                let count = (try? FileManager.default.contentsOfDirectory(atPath: url.path).count) ?? 0
-                row("Contains", "^[\(count) item](inflect: true)")
-            } else if let size = values?.fileSize {
-                row("Size", Int64(size).formatted(.byteCount(style: .file)))
-            }
-            if let date = values?.contentModificationDate { row("Modified", date.formatted(date: .abbreviated, time: .shortened)) }
-            if let date = values?.creationDate { row("Created", date.formatted(date: .abbreviated, time: .shortened)) }
-            row("Location", url.deletingLastPathComponent().path)
-        }
-        .font(.callout)
-    }
-
-    private func row(_ label: String, _ value: String) -> some View {
-        GridRow {
-            Text(label).foregroundStyle(.secondary)
-            Text(LocalizedStringKey(value)).textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-}
-
-// MARK: Home and This Mac
-
-struct HomePage: View {
-    let model: Browser
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Quick access").font(.title3.weight(.semibold))
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 8)], alignment: .leading, spacing: 8) {
-                    ForEach(model.prefs.pins, id: \.self) { path in
-                        PlaceTile(path: path, title: Places.name(path), model: model) {
-                            Text(path.replacingOccurrences(of: URL.homeDirectory.path, with: "~"))
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                }
-                Text("Recent").font(.title3.weight(.semibold)).padding(.top, 16)
-                if model.recent.isEmpty {
-                    Text("Files you open show up here.").foregroundStyle(.secondary)
-                } else {
-                    VStack(spacing: 0) {
-                        HStack {
-                            Text("Name").frame(maxWidth: .infinity, alignment: .leading)
-                            Text("Date opened").frame(width: 160, alignment: .leading)
-                            Text("Location").frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .font(.caption).foregroundStyle(.secondary).padding(.horizontal, 10).padding(.bottom, 6)
-                        ForEach(model.recent) { RecentRow(file: $0, model: model) }
-                    }
-                }
-            }
-            .padding(20)
-        }
-    }
-}
-
-struct RecentRow: View {
-    let file: RecentFile
-    let model: Browser
-    @State private var hovering = false
-
-    var body: some View {
-        HStack {
-            HStack(spacing: 8) {
-                FileIcon(path: file.item.url.path, size: 18)
-                Text(file.item.name).lineLimit(1).truncationMode(.middle)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            Text(file.used.formatted(date: .numeric, time: .shortened)).foregroundStyle(.secondary)
-                .frame(width: 160, alignment: .leading)
-            Text(file.item.url.deletingLastPathComponent().path.replacingOccurrences(of: URL.homeDirectory.path, with: "~"))
-                .foregroundStyle(.secondary).lineLimit(1).truncationMode(.head)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal, 10)
-        .frame(height: 30)
-        .background(RoundedRectangle(cornerRadius: 6).fill(.primary.opacity(hovering ? 0.06 : 0)))
-        .contentShape(Rectangle())
-        .onHover { hovering = $0 }
-        .onTapGesture { if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { NSWorkspace.shared.open(file.item.url) } }
-        .contextMenu {
-            Button("Open") { NSWorkspace.shared.open(file.item.url) }
-            Button("Open file location", systemImage: "folder") {
-                model.go(.folder(file.item.url.deletingLastPathComponent().path))
-            }
-            Button("Copy as path", systemImage: "link") {
-                model.pasteboard.clearContents()
-                model.pasteboard.setString(file.item.url.path, forType: .string)
-            }
-        }
-    }
-}
-
-struct ThisMacPage: View {
-    let model: Browser
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Folders").font(.title3.weight(.semibold))
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 210), spacing: 8)], alignment: .leading, spacing: 8) {
-                    ForEach(Places.userFolders) { folder in
-                        PlaceTile(path: folder.path, title: folder.title, model: model) {
-                            Text(folder.path.replacingOccurrences(of: URL.homeDirectory.path, with: "~"))
-                                .font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                        }
-                    }
-                }
-                Text("Devices and drives").font(.title3.weight(.semibold)).padding(.top, 16)
-                LazyVGrid(columns: [GridItem(.adaptive(minimum: 280), spacing: 8)], alignment: .leading, spacing: 8) {
-                    ForEach(Places.volumes()) { volume in
-                        PlaceTile(path: volume.path, title: volume.name, model: model) {
-                            ProgressView(value: Double(volume.total - volume.free), total: Double(max(volume.total, 1)))
-                                .tint(volume.free * 10 < volume.total ? .red : .accentColor)
-                            Text("\(volume.free.formatted(.byteCount(style: .file))) free of \(volume.total.formatted(.byteCount(style: .file)))")
-                                .font(.caption).foregroundStyle(.secondary)
-                        }
-                    }
-                }
-            }
-            .padding(20)
-        }
-    }
-}
-
-/// A folder or drive tile. Double-click opens, as on Home and This PC.
-struct PlaceTile<Detail: View>: View {
-    let path: String
+/// A command with its name, or just its icon when two panes share the width.
+struct TitledIcon: View {
     let title: String
-    let model: Browser
-    @ViewBuilder let detail: Detail
-    @State private var hovering = false
+    let symbol: String
+    let compact: Bool
 
     var body: some View {
-        HStack(spacing: 12) {
-            FileIcon(path: path, size: 44)
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).fontWeight(.medium).lineLimit(1)
-                detail
+        Group {
+            if compact {
+                Image(systemName: symbol).font(.system(size: 14)).frame(width: 32)
+            } else {
+                Label(title, systemImage: symbol).padding(.horizontal, 10)
             }
-            Spacer(minLength: 0)
         }
-        .padding(10)
-        .background(RoundedRectangle(cornerRadius: 10).fill(.primary.opacity(hovering ? 0.07 : 0.03)))
-        .contentShape(Rectangle())
-        .onHover { hovering = $0 }
-        .onTapGesture { if (NSApp.currentEvent?.clickCount ?? 1) >= 2 { model.go(.folder(path)) } }
-        .contextMenu { PlaceMenu(model: model, path: path) }
-        .dropDestination(for: URL.self) { urls, _ in
-            model.drop(urls, onto: URL(fileURLWithPath: path))
-            return true
-        }
+        .frame(height: 28)
+        .accessibilityLabel(title)
     }
 }
 
@@ -980,40 +723,56 @@ struct StatusBar: View {
     let model: Browser
 
     var body: some View {
-        HStack(spacing: 10) {
-            if model.folder != nil || model.isSearchActive {
-                Text("^[\(model.rows.count) item](inflect: true)")
-            }
-            let picked = model.selectedItems
-            if !picked.isEmpty {
-                Divider().frame(height: 12)
-                let bytes = picked.filter { !$0.isFolder }.reduce(Int64(0)) { $0 + $1.size }
-                let size = bytes > 0 ? "  " + bytes.formatted(.byteCount(style: .file)) : ""
-                Text("^[\(picked.count) item](inflect: true) selected\(size)")
-            }
-            if model.isSearching {
-                Divider().frame(height: 12)
-                Text("Searching…")
-            }
-            if let status = model.status { Text(status) }
-            Spacer()
-            IconButton(title: "Details", symbol: "list.bullet", help: "Details (Ctrl+Shift+6)", isOn: !model.prefs.iconView) {
-                model.prefs.iconView = false
-            }
-            IconButton(title: "Large icons", symbol: "square.grid.2x2", help: "Large icons (Ctrl+Shift+2)", isOn: model.prefs.iconView) {
-                model.prefs.iconView = true
+        GlassEffectContainer(spacing: 8) {
+            HStack(spacing: 8) {
+                HStack(spacing: 10) {
+                    if model.folder != nil || model.isSearchActive {
+                        Text("^[\(model.rows.count) item](inflect: true)")
+                    } else {
+                        Text(model.title)
+                    }
+                    let picked = model.selectedItems
+                    if !picked.isEmpty {
+                        Divider().frame(height: 12)
+                        let bytes = picked.filter { !$0.isFolder }.reduce(Int64(0)) { $0 + $1.size }
+                        let size = bytes > 0 ? "  " + bytes.formatted(.byteCount(style: .file)) : ""
+                        Text("^[\(picked.count) item](inflect: true) selected\(size)")
+                    }
+                    if model.isSearching {
+                        Divider().frame(height: 12)
+                        Text("Searching…")
+                    }
+                    if let status = model.status {
+                        Divider().frame(height: 12)
+                        Text(status)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .frame(height: 30)
+                .glassEffect(.regular, in: .capsule)
+                Spacer(minLength: 0)
+                HStack(spacing: 0) {
+                    IconButton(title: "Details", symbol: "list.bullet", help: "Details (Ctrl+Shift+6)", isOn: !model.prefs.iconView) {
+                        model.prefs.iconView = false
+                    }
+                    IconButton(title: "Large icons", symbol: "square.grid.2x2", help: "Large icons (Ctrl+Shift+2)", isOn: model.prefs.iconView) {
+                        model.prefs.iconView = true
+                    }
+                }
+                .padding(2)
+                .glassEffect(.regular, in: .capsule)
             }
         }
         .font(.system(size: 12))
         .foregroundStyle(.secondary)
-        .controlSize(.small)
-        .padding(.leading, 14)
-        .padding(.trailing, 6)
-        .frame(height: 30)
+        .lineLimit(1)
+        .padding(.horizontal, 10)
+        .padding(.bottom, 10)
+        .padding(.top, 4)
     }
 }
 
-/// Hands the view's NSWindow to the model, for the key handler.
+/// Hands the view's NSWindow to the window's panes, for the key handler.
 struct WindowReader: NSViewRepresentable {
     let found: (NSWindow) -> Void
 

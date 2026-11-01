@@ -14,6 +14,12 @@
 <key>LSApplicationCategoryType</key><string>public.app-category.utilities</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
+<key>CFBundleDocumentTypes</key><array><dict>
+  <key>CFBundleTypeName</key><string>Folder</string>
+  <key>CFBundleTypeRole</key><string>Viewer</string>
+  <key>LSHandlerRank</key><string>Alternate</string>
+  <key>LSItemContentTypes</key><array><string>public.folder</string></array>
+</dict></array>
 <key>NSDesktopFolderUsageDescription</key><string>Burrow shows the files in your Desktop folder.</string>
 <key>NSDocumentsFolderUsageDescription</key><string>Burrow shows the files in your Documents folder.</string>
 <key>NSDownloadsFolderUsageDescription</key><string>Burrow shows the files in your Downloads folder.</string>

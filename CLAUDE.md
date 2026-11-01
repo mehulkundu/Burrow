@@ -1,15 +1,16 @@
 # Burrow
 
-A native macOS file manager in SwiftUI that works like Windows 11 File Explorer:
-Home, Favorites and Locations in the navigation pane, header row with breadcrumbs
-and search, command bar, Details and Large icons views, details pane,
-Ctrl+X / Ctrl+C / Ctrl+V, Spotlight-backed search. `docs/EXPLORER.md` is the spec.
+A native macOS file manager in SwiftUI that works like Windows 11 File Explorer,
+dressed in Liquid Glass, with the best of Finder and the power tools on top:
+Quick Look, tags, undo, dual pane, batch rename, zip, folder sizes, Spotlight
+search. `docs/EXPLORER.md` is the spec.
 
 ## Layout
 
 - `Sources/Burrow/App.swift` window group (tabs), menus, the /tmp sample folder (`Fixture`).
 - `Sources/Burrow/Model.swift` `FS` (disk work and Spotlight off the main thread), `Prefs` (Favorites, hidden items, view, details pane), `Clip` (cut marks), `Browser` (one window: navigation, search, actions, Explorer keys in `handle(_:)`).
-- `Sources/Burrow/Views.swift` every view.
+- `Sources/Burrow/Views.swift` the window: `Workspace` (one or two panes), sidebar, glass header, command and status bars.
+- `Sources/Burrow/Pages.swift` what a pane shows: details table, icon grid, Home, This Mac, details panel, batch rename sheet.
 - `build.sh` builds, signs, and installs `~/Applications/Burrow.app`.
 
 ## Build and check
@@ -23,6 +24,8 @@ Ctrl+X / Ctrl+C / Ctrl+V, Spotlight-backed search. `docs/EXPLORER.md` is the spe
 
 - Never overwrite a file: name clashes get " (2)", copies into the same folder get " - Copy".
 - Delete moves to the Trash. There is no permanent delete.
+- Every file action records itself in `History` so Ctrl+Z can reverse it.
+- No layout feedback: never size a view from its own measured width (AppKit kills the app after too many layout passes). Use `ViewThatFits`.
 - Keys work with Ctrl (Windows habit) and Cmd. A key handler ignores events while a text field has focus.
 - System controls, SF Symbols, `.primary` / `.secondary` colors.
 

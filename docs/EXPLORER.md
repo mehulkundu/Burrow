@@ -49,6 +49,23 @@ Home / End first and last item · Shift+F10 context menu.
 - The index is Spotlight (`mdfind`). Folders Spotlight skips are crawled.
 - The Mac Delete key (Backspace) moves to the Trash, since Mac laptops have no Delete key.
 
+## Beyond Explorer
+
+| Feature | From | Key |
+| --- | --- | --- |
+| Quick Look | Finder | Space |
+| Colored tags | Finder | right-click > Tags |
+| Compress / Extract All | Finder, Explorer | right-click |
+| Show Package Contents | Finder | right-click |
+| Eject drives, drop a folder into Favorites | Finder | sidebar |
+| Undo for every file action | Explorer, Finder | Ctrl+Z |
+| Numbered or find-and-replace multi-rename | Explorer, Directory Opus | F2 on several |
+| Live preview pane, folder size | Explorer, Path Finder | Alt+Shift+P |
+| Dual pane, copy/move to the other pane | ForkLift, Total Commander | Ctrl+Shift+D, Shift+F5, Shift+F6 |
+| Search file contents | Explorer | search box menu |
+| Open in new tab | Explorer, Finder | right-click |
+| Open folders from outside | Finder | drop on Dock icon, `open -a Burrow <folder>` |
+
 ## Sources
 
 - [Keyboard shortcuts in Windows, Microsoft Support](https://support.microsoft.com/en-us/windows/keyboard-shortcuts-in-windows-dcc61a57-8ff0-cffe-9796-cb9706c75eec)
