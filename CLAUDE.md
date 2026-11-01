@@ -18,6 +18,7 @@ search. `docs/EXPLORER.md` is the spec.
 - Build and install: `./build.sh` (`--open` restarts the app). Fix every warning.
 - Self-test: `tools/selftest.sh`. Runs real file actions on `/tmp/Burrow-self`, exit 0 when every check passes. Add a check for every new action in `SelfTest.swift`.
 - Snapshots: `tools/snap.sh` writes `/tmp/Burrow-shots/{home,thismac,thismac-search,folder,icons,search}-{light,dark}.png`. Look at them after UI changes. Without Screen Recording permission the sidebar renders blank.
+- Release: push a `v*` tag. `.github/workflows/release.yml` builds on a macOS 26 runner (ad hoc signed, not notarized) and attaches `Burrow-<tag>.zip` to a GitHub release. The app version comes from the tag.
 - Self-test and snapshots refuse to run unless `APP_STORE` is in /tmp. They never touch the real pasteboard or the real pins.
 
 ## Rules

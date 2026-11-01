@@ -1,0 +1,20 @@
+# Push a tag like v0.2.0 and this builds Burrow.app and attaches
+# Burrow-v0.2.0.zip to a GitHub release with notes from the merged PRs.
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - run: swift --version
+      # No signing identity on the runner, so build.sh signs ad hoc.
+      - run: VERSION=$GITHUB_REF_NAME ./build.sh
+      - run: ditto -c -k --keepParent ~/Applications/Burrow.app "Burrow-$GITHUB_REF_NAME.zip"
+      - run: gh release create "$GITHUB_REF_NAME" "Burrow-$GITHUB_REF_NAME.zip" --title "Burrow $GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
