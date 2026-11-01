@@ -89,35 +89,50 @@ struct BrowserView: View {
 
     var body: some View {
         let active = workspace.active
-        // Glass panels on one backdrop: navigation pane left, files, details pane right.
+        // Full-height columns, each with its own slice of the one header row:
+        // navigation pane, files (one or two panes), details.
         HStack(spacing: 0) {
             if prefs.showSidebar {
-                Sidebar(workspace: workspace)
-                    .scrollContentBackground(.hidden)
-                    .frame(width: prefs.sidebarWidth)
-                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
-                    // Under the window buttons, like the panel in Finder.
-                    .padding(EdgeInsets(top: 40, leading: 10, bottom: 10, trailing: 0))
-                    .transition(.move(edge: .leading).combined(with: .opacity))
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        WindowButtonsGap()
+                        IconButton(title: "Hide navigation pane", symbol: "sidebar.left", help: "Hide navigation pane (Ctrl+Cmd+S)") {
+                            prefs.showSidebar = false
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .headerRow(window: window)
+                    Sidebar(workspace: workspace)
+                        .scrollContentBackground(.hidden)
+                }
+                .frame(width: prefs.sidebarWidth)
+                .background(.regularMaterial)
+                .transition(.move(edge: .leading).combined(with: .opacity))
                 ResizeHandle(width: $prefs.sidebarWidth, range: 180...420, growsRight: true)
             }
-            HStack(spacing: 0) {
-                PaneView(model: workspace.left, workspace: workspace, isActive: !workspace.rightActive)
-                if let right = workspace.right {
-                    Divider()
-                    PaneView(model: right, workspace: workspace, isActive: workspace.rightActive)
-                        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { workspace.rightPaneX = $0 }
-                }
+            PaneView(model: workspace.left, workspace: workspace, isActive: !workspace.rightActive, leadsWindow: !prefs.showSidebar)
+            if let right = workspace.right {
+                Divider()
+                PaneView(model: right, workspace: workspace, isActive: workspace.rightActive)
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minX } action: { workspace.rightPaneX = $0 }
             }
-            // With the navigation pane hidden, the header steps down clear of the window buttons.
-            .padding(.top, prefs.showSidebar ? 0 : 30)
             if prefs.showDetails {
                 ResizeHandle(width: $prefs.detailsWidth, range: 220...520, growsRight: false)
-                DetailsPane(model: active)
-                    .frame(width: prefs.detailsWidth)
-                    .glassEffect(.regular, in: RoundedRectangle(cornerRadius: 18))
-                    .padding(EdgeInsets(top: 10, leading: 0, bottom: 10, trailing: 10))
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                VStack(spacing: 0) {
+                    HStack(spacing: 0) {
+                        Text("Details").fontWeight(.medium).foregroundStyle(.secondary).padding(.leading, 6)
+                        Spacer(minLength: 0)
+                        IconButton(title: "Close details", symbol: "xmark", help: "Close the details pane (Alt+Shift+P)") {
+                            prefs.showDetails = false
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .headerRow(window: window)
+                    DetailsPane(model: active)
+                }
+                .frame(width: prefs.detailsWidth)
+                .background(.regularMaterial)
+                .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
         .animation(.smooth(duration: 0.25), value: prefs.showDetails)
@@ -165,34 +180,37 @@ struct PaneView: View {
     @Bindable var model: Browser
     let workspace: Workspace
     let isActive: Bool
+    /// True for the pane at the window's left edge when the navigation pane is hidden:
+    /// its header makes room for the window buttons.
+    var leadsWindow = false
     @FocusState private var contentFocused: Bool
 
     var body: some View {
         let dual = workspace.right != nil
-        MainContent(model: model)
-            .focused($contentFocused)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .safeAreaInset(edge: .top, spacing: 0) {
-                GlassEffectContainer(spacing: 8) {
-                    VStack(spacing: 8) {
-                        HeaderBar(model: model, highlighted: dual && isActive)
-                        // Names on the commands only when the pane has room for them. ViewThatFits
-                        // picks from the space offered, so the bar can't feed back into the layout.
+        VStack(spacing: 0) {
+            HeaderBar(model: model, highlighted: dual && isActive, leadsWindow: leadsWindow)
+                .focusEffectDisabled()
+            MainContent(model: model)
+                .focused($contentFocused)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .safeAreaInset(edge: .top, spacing: 0) {
+                    // Names on the commands only when the pane has room for them. ViewThatFits
+                    // picks from the space offered, so the bar can't feed back into the layout.
+                    GlassEffectContainer(spacing: 8) {
                         ViewThatFits(in: .horizontal) {
                             if !dual { CommandBar(model: model, workspace: workspace) }
                             CommandBar(model: model, workspace: workspace, compact: true)
                         }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .focusEffectDisabled()
                 }
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
-                .padding(.bottom, 6)
-                .focusEffectDisabled()
-            }
-            .safeAreaInset(edge: .bottom, spacing: 0) {
-                StatusBar(model: model).focusEffectDisabled()
-            }
-            .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+                .safeAreaInset(edge: .bottom, spacing: 0) {
+                    StatusBar(model: model).focusEffectDisabled()
+                }
+                .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+        }
             .quickLookPreview($model.quickLook, in: model.rows.map(\.url))
             .onChange(of: model.location) { contentFocused = true }
             .alert("Burrow", isPresented: Binding(get: { model.alert != nil }, set: { if !$0 { model.alert = nil } })) {
@@ -388,20 +406,25 @@ struct PlaceMenu: View {
 struct HeaderBar: View {
     @Bindable var model: Browser
     var highlighted = false
+    var leadsWindow = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 6) {
+            if leadsWindow {
+                WindowButtonsGap()
+                IconButton(title: "Show navigation pane", symbol: "sidebar.left", help: "Show navigation pane (Ctrl+Cmd+S)") {
+                    model.prefs.showSidebar = true
+                }
+            }
             HStack(spacing: 0) {
-                IconButton(title: "Back", symbol: "arrow.left", help: "Back (Alt+Left)") { model.goBack() }
+                IconButton(title: "Back", symbol: "chevron.left", help: "Back (Alt+Left)") { model.goBack() }
                     .disabled(!model.canGoBack)
-                IconButton(title: "Forward", symbol: "arrow.right", help: "Forward (Alt+Right)") { model.goForward() }
+                IconButton(title: "Forward", symbol: "chevron.right", help: "Forward (Alt+Right)") { model.goForward() }
                     .disabled(!model.canGoForward)
                 IconButton(title: "Up", symbol: "arrow.up", help: "Up to the parent folder (Alt+Up)") { model.goUp() }
                     .disabled(!model.canGoUp)
                 IconButton(title: "Refresh", symbol: "arrow.clockwise", help: "Refresh (F5)") { model.reload() }
             }
-            .padding(4)
-            .glassEffect(.regular, in: .capsule)
             AddressBar(model: model)
                 .glassEffect(.regular.tint(highlighted ? .accentColor.opacity(0.18) : nil), in: .capsule)
             // The search box takes its width first; the address bar folds folders into "…" to fit.
@@ -410,7 +433,25 @@ struct HeaderBar: View {
                 .glassEffect(.regular, in: .capsule)
                 .layoutPriority(1)
         }
-        .background { TitleBarArea(window: model.window) }
+        .padding(.horizontal, 8)
+        .headerRow(window: model.window)
+    }
+}
+
+/// The space the close, minimize, and zoom buttons sit in.
+struct WindowButtonsGap: View {
+    var body: some View { Color.clear.frame(width: 72, height: 1) }
+}
+
+extension View {
+    /// The one header row every column shares, centered on the window buttons' line.
+    /// Empty space in it moves the window, and a double-click zooms it.
+    func headerRow(window: NSWindow?) -> some View {
+        frame(height: 28)
+            .padding(.top, 4)
+            .padding(.bottom, 8)
+            .background { TitleBarArea(window: window) }
+            .focusEffectDisabled()
     }
 }
 
@@ -442,19 +483,26 @@ struct ResizeHandle: View {
     @State private var start: Double?
 
     var body: some View {
-        Color.clear
-            .frame(width: 10)
-            .contentShape(Rectangle())
-            .pointerStyle(.columnResize(directions: .all))
-            .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
-                .onChanged { drag in
-                    let from = start ?? width
-                    start = from
-                    let delta = growsRight ? drag.translation.width : -drag.translation.width
-                    width = min(max(from + delta, range.lowerBound), range.upperBound)
-                }
-                .onEnded { _ in start = nil })
-            .help("Drag to resize")
+        Rectangle()
+            .fill(.separator)
+            .frame(width: 1)
+            .overlay {
+                Color.clear
+                    .frame(width: 9)
+                    .contentShape(Rectangle())
+                    .pointerStyle(.columnResize(directions: .all))
+                    .gesture(DragGesture(minimumDistance: 1, coordinateSpace: .global)
+                        .onChanged { drag in
+                            let from = start ?? width
+                            start = from
+                            let delta = growsRight ? drag.translation.width : -drag.translation.width
+                            width = min(max(from + delta, range.lowerBound), range.upperBound)
+                        }
+                        .onEnded { _ in start = nil })
+                    .help("Drag to resize")
+            }
+            // Above the column after it, so the whole grip catches the pointer.
+            .zIndex(1)
     }
 }
 
@@ -495,7 +543,7 @@ struct AddressBar: View {
                     .onTapGesture { model.editingAddress = true }
             }
         }
-        .frame(height: 36)
+        .frame(height: 28)
         .help("Click empty space to type a path (Ctrl+L)")
     }
 
@@ -620,7 +668,7 @@ struct SearchBox: View {
         }
         .padding(.leading, 14)
         .padding(.trailing, 12)
-        .frame(height: 36)
+        .frame(height: 28)
         .onChange(of: model.focusSearch) { focused = true }
         .onChange(of: model.prefs.searchContents) { model.searchAgain() }
     }
