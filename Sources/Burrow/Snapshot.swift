@@ -3,23 +3,20 @@ import IOKit.pwr_mgt
 import SwiftUI
 
 /// Screenshot mode for agents.
-///   APP_STORE=/tmp/test.store APP_SNAPSHOT=/tmp/shots ~/Applications/Burrow.app/Contents/MacOS/Burrow
-/// writes <page>-light.png and <page>-dark.png for every sidebar page, and
-/// settings-<tab>-light.png and settings-<tab>-dark.png for every Settings tab, then quits.
-/// Each PNG gets a <page>-<mode>-layout.json with the grid probes (tools/check-layout.swift).
-/// APP_SNAPSHOT_PAGES=all,starred limits the pages. Add "settings" to include Settings.
-/// Add APP_ACCENT=<id> to see the pages in another accent.
+///   APP_STORE=/tmp/Burrow-test APP_SNAPSHOT=/tmp/Burrow-shots Burrow   (tools/snap.sh)
+/// writes home, thismac, folder, icons, and search PNGs in light and dark, then quits.
 enum Snapshot {
-    static func runIfRequested(model: AppModel, openSettings: OpenSettingsAction) {
+    private static var started = false
+
+    static func runIfRequested(model: Browser) {
         let env = ProcessInfo.processInfo.environment
-        guard let dir = env["APP_SNAPSHOT"], !dir.isEmpty else { return }
-        // Snapshots never run against the real database.
-        guard Store.isOverridden else {
-            print("SNAPSHOT refused: set APP_STORE to a file in /tmp")
+        guard let dir = env["APP_SNAPSHOT"], !dir.isEmpty, !started else { return }
+        started = true
+        guard let root = Fixture.make() else {
+            print("SNAPSHOT refused: set APP_STORE to a folder in /tmp")
             NSApp.terminate(nil)
             return
         }
-        let only = env["APP_SNAPSHOT_PAGES"].map { Set($0.split(separator: ",").map(String.init)) }
         Task {
             // A sleeping display gives screencapture nothing. Declaring user
             // activity wakes it; the assertion keeps it on until the run quits.
@@ -32,51 +29,69 @@ enum Snapshot {
             try? await Task.sleep(for: .seconds(1.5))
             for mode in ["light", "dark"] {
                 NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
-                for page in SidebarItem.allCases where only?.contains(page.rawValue) ?? true {
-                    model.sidebar = page
+                let (iconView, showDetails) = (model.prefs.iconView, model.prefs.showDetails)
+                model.prefs.iconView = false
+                model.prefs.showDetails = false
+                for page in [Location.home, .thisMac] {
+                    model.go(page)
+                    await model.settle()
                     try? await Task.sleep(for: .seconds(0.8))
-                    capture(to: "\(dir)/\(page.rawValue)-\(mode).png")
+                    capture(to: "\(dir)/\(page == .home ? "home" : "thismac")-\(mode).png")
                 }
-            }
-            if only == nil || only?.contains("settings") == true {
-                let main = NSApp.windows.first { $0.canBecomeMain && !$0.isSheet }
-                openSettings()
-                try? await Task.sleep(for: .seconds(1))
-                for mode in ["light", "dark"] {
-                    NSApp.appearance = NSAppearance(named: mode == "light" ? .aqua : .darkAqua)
-                    for tab in SettingsTab.allCases {
-                        model.settingsTab = tab
-                        try? await Task.sleep(for: .seconds(0.8))
-                        let settings = NSApp.windows.first { $0.isVisible && $0 !== main && !$0.isSheet }
-                        capture(to: "\(dir)/settings-\(tab.rawValue)-\(mode).png", window: settings)
-                    }
+                model.searchText = "Desktop"
+                await model.settle()
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(to: "\(dir)/thismac-search-\(mode).png")
+                model.searchText = ""
+
+                model.go(.folder(root.path))
+                await model.settle()
+                // Only the faded look: the real pasteboard stays as the user left it.
+                Clip.shared.cut = Set(model.rows.filter { $0.name.hasPrefix("file") }.map(\.url))
+                model.selection = Set(model.rows.filter { $0.name == "readme.txt" }.map(\.url))
+                model.prefs.showDetails = true
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(to: "\(dir)/folder-\(mode).png")
+                // The "…" tree opens in a popover, a window of its own: draw it by itself.
+                let tree = ImageRenderer(content: PathTree(model: model) {}
+                    .background(.background)
+                    .environment(\.colorScheme, mode == "light" ? .light : .dark))
+                tree.scale = 2
+                if let image = tree.cgImage,
+                   let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: "\(dir)/pathtree-\(mode).png"))
                 }
+                Clip.shared.cut = []
+                model.prefs.showDetails = false
+
+                model.prefs.iconView = true
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(to: "\(dir)/icons-\(mode).png")
+                model.prefs.iconView = false
+
+                model.searchText = "report"
+                await model.settle()
+                try? await Task.sleep(for: .seconds(0.8))
+                capture(to: "\(dir)/search-\(mode).png")
+                (model.prefs.iconView, model.prefs.showDetails) = (iconView, showDetails)
             }
             print("SNAPSHOT done \(dir)")
-            // An open sheet refuses terminate, and the run would wait forever.
-            for window in NSApp.windows { if let sheet = window.attachedSheet { window.endSheet(sheet) } }
             NSApp.terminate(nil)
         }
     }
 
-    /// Captures the real window with screencapture, so glass, sidebars, and
-    /// materials look exactly as on screen. That needs Screen Recording
-    /// permission for the app that started this one (your terminal, or Claude).
-    /// Without it, falls back to drawing the view hierarchy, which leaves
-    /// sidebars and glass blank.
-    private static func capture(to path: String, window: NSWindow? = nil) {
-        // Another app can hide this one while snapshots run (computer use hides
-        // apps it does not control). Hidden windows cannot be captured.
+    /// Captures the real window with screencapture, so sidebars and glass
+    /// look as on screen. That needs Screen Recording permission for the app
+    /// that started this one. Without it, draws the view hierarchy instead.
+    private static func capture(to path: String) {
+        // Another app can hide this one while snapshots run. Hidden windows cannot be captured.
         if NSApp.isHidden { NSApp.unhideWithoutActivation() }
-        guard let window = window ?? NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) else {
+        guard let window = NSApp.windows.first(where: { $0.canBecomeMain && !$0.isSheet }) else {
             print("SNAPSHOT no window")
             return
         }
-        // Active, like a window someone is using: real accent colors and focus rings.
         NSApp.activate()
         window.makeKeyAndOrderFront(nil)
-        let size = window.contentView?.bounds.size ?? .zero
-        GridProbes.shared.write(to: path.replacingOccurrences(of: ".png", with: "-layout.json"), window: size)
         try? FileManager.default.removeItem(atPath: path)
         // The first capture of a run sometimes misses the window. Try three times.
         for _ in 1...3 {
