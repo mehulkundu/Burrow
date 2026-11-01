@@ -733,8 +733,12 @@ enum Places {
     func copyPaths(_ urls: Set<URL>) {
         let paths = rows.map(\.url).filter(urls.contains).map(\.path)
         guard !paths.isEmpty else { return }
+        copyPath(paths.joined(separator: "\n"))
+    }
+
+    func copyPath(_ path: String) {
         pasteboard.clearContents()
-        pasteboard.setString(paths.joined(separator: "\n"), forType: .string)
+        pasteboard.setString(path, forType: .string)
         Clip.shared.cut = []
     }
 

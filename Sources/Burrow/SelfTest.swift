@@ -107,6 +107,8 @@ enum SelfTest {
             check("crumbs start at This Mac", b.crumbs.first?.title == "This Mac")
             b.go(.folder(URL.homeDirectory.path + "/Documents"))
             check("folders in your home show your name, not the disk", b.crumbs.map(\.title) == ["This Mac", NSUserName(), "Documents"])
+            b.copyPath(b.folder!.path)
+            check("the address bar copies the folder's path", b.pasteboard.string(forType: .string) == URL.homeDirectory.path + "/Documents")
             b.go(path: "home")
             check("the address bar takes Home", b.location == .home)
 

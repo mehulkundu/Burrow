@@ -52,6 +52,15 @@ enum Snapshot {
                 model.prefs.showDetails = true
                 try? await Task.sleep(for: .seconds(0.8))
                 capture(to: "\(dir)/folder-\(mode).png")
+                // The "…" tree opens in a popover, a window of its own: draw it by itself.
+                let tree = ImageRenderer(content: PathTree(model: model) {}
+                    .background(.background)
+                    .environment(\.colorScheme, mode == "light" ? .light : .dark))
+                tree.scale = 2
+                if let image = tree.cgImage,
+                   let png = NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:]) {
+                    try? png.write(to: URL(fileURLWithPath: "\(dir)/pathtree-\(mode).png"))
+                }
                 Clip.shared.cut = []
                 model.prefs.showDetails = false
 

@@ -263,6 +263,7 @@ struct IconButton: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: 14))
+                .contentTransition(.symbolEffect(.replace))
                 .frame(width: 32, height: 28)
         }
         .buttonStyle(HoverStyle(isOn: isOn))
@@ -392,10 +393,7 @@ struct PlaceMenu: View {
             model.prefs.togglePin(path)
         }
         Divider()
-        Button("Copy as path", systemImage: "link") {
-            model.pasteboard.clearContents()
-            model.pasteboard.setString(path, forType: .string)
-        }
+        Button("Copy as path", systemImage: "link") { model.copyPath(path) }
         Button("Open in Terminal", systemImage: "terminal") { model.openTerminal(URL(fileURLWithPath: path)) }
     }
 }
@@ -508,11 +506,12 @@ struct ResizeHandle: View {
 struct AddressBar: View {
     @Bindable var model: Browser
     @State private var text = ""
+    @State private var copied = false
     @FocusState private var focused: Bool
 
     var body: some View {
         HStack(spacing: 0) {
-            locationIcon.padding(.leading, 12).padding(.trailing, 4)
+            LocationIcon(location: model.location).padding(.leading, 12).padding(.trailing, 4)
             if model.editingAddress {
                 TextField("Address", text: $text)
                     .textFieldStyle(.plain)
@@ -540,16 +539,31 @@ struct AddressBar: View {
                     .frame(minWidth: 24, maxWidth: .infinity, maxHeight: .infinity)
                     .contentShape(Rectangle())
                     .onTapGesture { model.editingAddress = true }
+                    .help("Click empty space to type a path (Ctrl+L)")
+                if let path = model.folder?.path {
+                    IconButton(title: "Copy path", symbol: copied ? "checkmark" : "doc.on.doc", help: "Copy path") {
+                        model.copyPath(path)
+                        copied = true
+                    }
+                    .task(id: copied) {
+                        guard copied else { return }
+                        try? await Task.sleep(for: .seconds(1.5))
+                        copied = false
+                    }
+                }
             }
         }
         .frame(height: 28)
-        .help("Click empty space to type a path (Ctrl+L)")
     }
+}
 
-    @ViewBuilder private var locationIcon: some View {
-        switch model.location {
-        case .home: Image(systemName: "house").foregroundStyle(.secondary)
-        case .thisMac: Image(systemName: "desktopcomputer").foregroundStyle(.secondary)
+struct LocationIcon: View {
+    let location: Location
+
+    var body: some View {
+        switch location {
+        case .home: Image(systemName: "house").foregroundStyle(.secondary).frame(width: 16, height: 16)
+        case .thisMac: Image(systemName: "desktopcomputer").foregroundStyle(.secondary).frame(width: 16, height: 16)
         case .folder(let path): FileIcon(path: path)
         }
     }
@@ -561,21 +575,19 @@ struct CrumbRow: View {
     let model: Browser
     let crumbs: ArraySlice<Crumb>
     var hidden: ArraySlice<Crumb> = []
+    @State private var showTree = false
 
     var body: some View {
         HStack(spacing: 0) {
             if let last = hidden.last {
-                Menu {
-                    ForEach(Array(hidden.enumerated()), id: \.offset) { _, crumb in
-                        Button(crumb.title) { model.go(crumb.location) }
-                    }
-                } label: {
+                Button { showTree = true } label: {
                     Text("…").padding(.horizontal, 7).frame(height: 26)
                 }
-                .menuStyle(.button)
-                .menuIndicator(.hidden)
-                .buttonStyle(HoverStyle())
+                .buttonStyle(HoverStyle(isOn: showTree))
                 .accessibilityLabel("Earlier folders")
+                .popover(isPresented: $showTree, arrowEdge: .bottom) {
+                    PathTree(model: model) { showTree = false }
+                }
                 SubfolderMenu(model: model, parent: last.location)
             }
             ForEach(Array(crumbs.enumerated()), id: \.offset) { index, crumb in
@@ -593,6 +605,65 @@ struct CrumbRow: View {
         }
         .lineLimit(1)
         .fixedSize()
+    }
+}
+
+/// The "…" in the address bar: the whole path as a tree, This Mac at the root and here at the tip.
+struct PathTree: View {
+    let model: Browser
+    let dismiss: () -> Void
+
+    var body: some View {
+        let crumbs = model.crumbs
+        VStack(alignment: .leading, spacing: 0) {
+            ForEach(Array(crumbs.enumerated()), id: \.offset) { depth, crumb in
+                let here = depth == crumbs.count - 1
+                Button {
+                    dismiss()
+                    model.go(crumb.location)
+                } label: {
+                    HStack(spacing: 7) {
+                        LocationIcon(location: crumb.location)
+                        Text(crumb.title).fontWeight(here ? .semibold : .regular)
+                    }
+                    .padding(.leading, TreeBranch.lead + CGFloat(depth) * TreeBranch.indent)
+                    .padding(.trailing, 14)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .background { TreeBranch(depth: depth, hasChild: !here).stroke(.tertiary, lineWidth: 1) }
+                }
+                .buttonStyle(HoverStyle(isOn: here))
+            }
+        }
+        .lineLimit(1)
+        .fixedSize()
+        .padding(6)
+    }
+}
+
+/// The line from a folder's icon down and across to the folder inside it.
+nonisolated struct TreeBranch: Shape {
+    static let lead: CGFloat = 8
+    static let indent: CGFloat = 20
+    let depth: Int
+    let hasChild: Bool
+
+    func path(in rect: CGRect) -> Path {
+        Path { p in
+            let mid = rect.midY, r: CGFloat = 4
+            if depth > 0 {
+                // Down from the parent's icon, round the corner, stop just short of this icon.
+                let x = Self.lead + CGFloat(depth - 1) * Self.indent + 8
+                p.move(to: CGPoint(x: x, y: rect.minY))
+                p.addLine(to: CGPoint(x: x, y: mid - r))
+                p.addQuadCurve(to: CGPoint(x: x + r, y: mid), control: CGPoint(x: x, y: mid))
+                p.addLine(to: CGPoint(x: x + Self.indent - 10, y: mid))
+            }
+            if hasChild {
+                let x = Self.lead + CGFloat(depth) * Self.indent + 8
+                p.move(to: CGPoint(x: x, y: mid + 10))
+                p.addLine(to: CGPoint(x: x, y: rect.maxY))
+            }
+        }
     }
 }
 

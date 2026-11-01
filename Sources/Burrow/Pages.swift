@@ -500,10 +500,7 @@ struct RecentRow: View {
             Button("Open file location", systemImage: "folder") {
                 model.go(.folder(file.item.url.deletingLastPathComponent().path))
             }
-            Button("Copy as path", systemImage: "link") {
-                model.pasteboard.clearContents()
-                model.pasteboard.setString(file.item.url.path, forType: .string)
-            }
+            Button("Copy as path", systemImage: "link") { model.copyPath(file.item.url.path) }
         }
     }
 }
